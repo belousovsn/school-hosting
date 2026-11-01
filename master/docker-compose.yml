@@ -1,0 +1,30 @@
+services:
+  master:
+    build: .
+    environment:
+      - SERVICE_URL_MASTER_8000
+      - 'CF_API_URL=${CF_API_URL}'
+      - 'CF_TOKEN=${CF_TOKEN}'
+      - 'CF_PROJECT_UUID=${CF_PROJECT_UUID}'
+      - 'CF_SERVER_UUID=${CF_SERVER_UUID}'
+      - 'CF_KEY_UUID=${CF_KEY_UUID}'
+      - 'FORGEJO_URL=${FORGEJO_URL}'
+      - 'FORGEJO_TOKEN=${FORGEJO_TOKEN}'
+      - 'FORGEJO_SSH=${FORGEJO_SSH}'
+      - 'ORG=${ORG:-school}'
+      - 'MASTER_URL=${MASTER_URL}'
+      - 'WEBHOOK_SECRET=${WEBHOOK_SECRET}'
+      - 'MASTER_USER=${MASTER_USER:-teacher}'
+      - 'MASTER_PASSWORD=${MASTER_PASSWORD}'
+      - 'NOTIFY_TG_TOKEN=${NOTIFY_TG_TOKEN}'
+      - 'NOTIFY_TG_CHAT=${NOTIFY_TG_CHAT}'
+      - 'APPS_DOMAIN=${APPS_DOMAIN}'
+      - DB_PATH=/data/master.db
+    volumes:
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+      - 'master-data:/data'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

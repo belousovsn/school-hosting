@@ -1,0 +1,8 @@
+# Пароли и токены тестового стенда, только локально
+school-test-credentials.md
+*.env
+.env*
+
+__pycache__/
+.pytest_cache/
+*.db
