@@ -34,6 +34,7 @@
 - `FORGEJO_URL`, `FORGEJO_TOKEN`, `FORGEJO_SSH`, `ORG`: доступ к Forgejo;
 - `MASTER_URL`, `WEBHOOK_SECRET`: адрес мастера и секрет вебхуков;
 - `MASTER_USER`, `MASTER_PASSWORD`: вход учителя в панель;
+- `MASTER_EXTRA_USERS`: дополнительные входы в виде `логин:пароль,логин2:пароль2`;
 - `APPS_DOMAIN`: домен для сайтов учеников, например `school.ru` или `1.2.3.4.sslip.io`;
 - `NOTIFY_TG_TOKEN`, `NOTIFY_TG_CHAT`: необязательные уведомления в Telegram.
 

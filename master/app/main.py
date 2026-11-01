@@ -20,14 +20,24 @@ from . import db, pipeline
 from .analyze import BOT_TYPES, TYPES, WEB_TYPES
 from .clients import CFG, ApiError, Telegram, site_url
 
-USER = os.environ.get("MASTER_USER", "teacher")
-PASSWORD = os.environ.get("MASTER_PASSWORD", "")
+def parse_users(main_user: str, main_password: str, extra: str) -> dict[str, str]:
+    """Основной учитель плюс дополнительные из строки вида 'логин:пароль,логин2:пароль2'."""
+    users = {main_user: main_password} if main_password else {}
+    for pair in extra.split(","):
+        login, _, password = pair.strip().partition(":")
+        if login and password:
+            users[login] = password
+    return users
+
+
+USERS = parse_users(os.environ.get("MASTER_USER", "teacher"), os.environ.get("MASTER_PASSWORD", ""),
+                    os.environ.get("MASTER_EXTRA_USERS", ""))
 security = HTTPBasic()
 
 
 def auth(cred: HTTPBasicCredentials = Depends(security)):
-    ok = PASSWORD and secrets.compare_digest(cred.username, USER) and secrets.compare_digest(cred.password, PASSWORD)
-    if not ok:
+    expected = USERS.get(cred.username)
+    if not (expected and secrets.compare_digest(cred.password.encode(), expected.encode())):
         raise HTTPException(401, "Нужен вход", headers={"WWW-Authenticate": "Basic"})
 
 

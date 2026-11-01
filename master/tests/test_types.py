@@ -68,3 +68,9 @@ class TypesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_parse_users():
+    from app.main import parse_users
+    assert parse_users("teacher", "p1", "test:test, x:") == {"teacher": "p1", "test": "test"}
+    assert parse_users("teacher", "", "") == {}
