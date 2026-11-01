@@ -91,10 +91,13 @@ class Forgejo:
                 "author": {"name": "Мастер подключения", "email": "master@school.local"}}
         return _check(await self.c.post(f"/repos/{self.org}/{name}/contents", json=body)).json()["commit"]["sha"]
 
-    async def set_master_hook(self, name: str):
+    async def remove_hooks(self, name: str):
         hooks = _check(await self.c.get(f"/repos/{self.org}/{name}/hooks")).json()
-        for h in hooks:  # прямые вебхуки в Coolify убираем: сборку запускает только мастер
+        for h in hooks:
             await self.c.delete(f"/repos/{self.org}/{name}/hooks/{h['id']}")
+
+    async def set_master_hook(self, name: str):
+        await self.remove_hooks(name)  # прямые вебхуки в Coolify убираем: сборку запускает только мастер
         body = {"type": "gitea", "active": True, "events": ["push"],
                 "config": {"url": CFG["MASTER_URL"].rstrip("/") + "/hooks/forgejo", "content_type": "json", "secret": CFG["WEBHOOK_SECRET"]}}
         _check(await self.c.post(f"/repos/{self.org}/{name}/hooks", json=body))
@@ -166,6 +169,14 @@ class Coolify:
 
     async def start(self, uuid: str):
         _check(await self.c.post(f"/applications/{uuid}/start"))
+
+    async def delete(self, uuid: str):
+        """Удаляет приложение вместе с контейнером и томами."""
+        r = await self.c.delete(f"/applications/{uuid}", params={
+            "delete_configurations": "true", "delete_volumes": "true",
+            "docker_cleanup": "true", "delete_connected_networks": "true"})
+        if r.status_code != 404:
+            _check(r)
 
 
 class Telegram:

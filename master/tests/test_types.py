@@ -74,3 +74,18 @@ def test_parse_users():
     from app.main import parse_users
     assert parse_users("teacher", "p1", "test:test, x:") == {"teacher": "p1", "test": "test"}
     assert parse_users("teacher", "", "") == {}
+
+
+def test_deploy_progress_stage():
+    import json
+    from app.pipeline import deploy_progress
+    logs = [{"output": "Starting deployment of school/x", "hidden": False},
+            {"output": "Importing ssh://git@host/school/x.git", "hidden": False},
+            {"output": "Building docker image started.", "hidden": False},
+            {"output": "#5 RUN pip install -r requirements.txt", "hidden": False},
+            {"output": "secret internal line", "hidden": True}]
+    p = deploy_progress({"status": "in_progress", "logs": json.dumps(logs), "created_at": "2026-11-01T18:47:41.000000Z"})
+    assert p["stage"] == "Собираю проект"
+    assert p["line"].startswith("#5 RUN pip")
+    assert p["started"] > 0
+    assert deploy_progress({"status": "queued", "logs": None})["stage"] == "Жду очереди на сборку"

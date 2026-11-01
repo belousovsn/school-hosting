@@ -7,6 +7,7 @@ import json
 import posixpath
 import re
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 from . import db
@@ -142,15 +143,55 @@ async def handle_push(project_id: int, sha: str, force: bool = False):
         await notify(text)
 
 
+# Этапы сборки по строкам лога Coolify. Ищем с конца лога первую узнаваемую строку.
+STAGES = [
+    (("rolling update", "new container", "removing old container", "starting new application"), "Запускаю новую версию"),
+    (("building docker image", "docker build", "nixpacks build", "pip install", "npm ci", "npm install"), "Собираю проект"),
+    (("generating nixpacks", "nixpacks plan", "build pack"), "Готовлю сборку"),
+    (("importing", "cloning", "git ", "commit sha"), "Скачиваю код"),
+    (("starting deployment", "preparing container", "queued"), "Готовлю сервер"),
+]
+_progress: dict[int, dict] = {}
+
+
+def deploy_progress(dep: dict) -> dict:
+    """Этап, последняя строка лога и время начала текущей сборки."""
+    try:
+        logs = [l for l in json.loads(dep.get("logs") or "[]") if not l.get("hidden") and l.get("output", "").strip()]
+    except (ValueError, TypeError):
+        logs = []
+    stage = "Жду очереди на сборку" if dep.get("status") == "queued" else "Начинаю сборку"
+    for line in reversed(logs):
+        low = line["output"].lower()
+        match = next((name for keys, name in STAGES if any(k in low for k in keys)), None)
+        if match:
+            stage = match
+            break
+    last = logs[-1]["output"].strip().splitlines()[-1][:160] if logs else ""
+    started = 0.0
+    try:
+        started = datetime.fromisoformat(dep["created_at"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, AttributeError):
+        pass
+    return {"stage": stage, "line": last, "started": started}
+
+
+def progress(pid: int) -> dict | None:
+    return _progress.get(pid)
+
+
 async def refresh_status(p: dict) -> dict:
     """Подтягивает статус сборки из Coolify и проверяет, что процесс после сборки не падает."""
     pid = p["id"]
+    _progress.pop(pid, None)
     if p["status"] == "deploying":
         try:
             dep = await cf.latest_deployment(p["app_uuid"])
         except Exception:
             return p
         st = (dep or {}).get("status")
+        if dep and st in ("queued", "in_progress"):
+            _progress[pid] = deploy_progress(dep)
         if st == "finished":
             db.run("UPDATE projects SET status='running' WHERE id=?", pid)
             db.event(pid, "info", "Сборка прошла, проект запущен.")
@@ -181,14 +222,37 @@ async def refresh_status(p: dict) -> dict:
     return p
 
 
+_site_cache: dict[str, tuple[float, bool]] = {}
+
+
 async def site_responds(url: str) -> bool:
-    """Сайт считается рабочим, если отвечает без ошибки сервера и это не заглушка прокси."""
+    """Сайт считается рабочим, если отвечает без ошибки сервера и это не заглушка прокси.
+    Ответ кешируется на 20 секунд: страницы панели опрашивают статус часто."""
+    cached = _site_cache.get(url)
+    if cached and time.time() - cached[0] < 20:
+        return cached[1]
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
             r = await c.get(url)
+        ok = r.status_code < 500 and "no available server" not in r.text.lower()
     except httpx.HTTPError:
-        return False
-    return r.status_code < 500 and "no available server" not in r.text.lower()
+        ok = False
+    _site_cache[url] = (time.time(), ok)
+    return ok
+
+
+async def delete_project(pid: int):
+    """Убирает проект с сервера. Репозиторий в Forgejo остаётся, из него можно подключить проект заново."""
+    p = db.one("SELECT * FROM projects WHERE id=?", pid)
+    await cf.delete(p["app_uuid"])
+    try:
+        await fj.remove_hooks(p["repo"])
+    except Exception:
+        pass  # репозитория уже может не быть
+    db.run("DELETE FROM events WHERE project_id=?", pid)
+    db.run("DELETE FROM projects WHERE id=?", pid)
+    _progress.pop(pid, None)
+    _cpu_strikes.pop(pid, None)
 
 
 async def cpu_monitor():
