@@ -74,6 +74,15 @@ class Forgejo:
         r = _check(await self.c.get(f"/repos/{self.org}/{name}/branches/{branch}"))
         return r.json()["commit"]["id"]
 
+    async def has_commit(self, name: str, sha: str) -> bool:
+        r = await self.c.get(f"/repos/{self.org}/{name}/git/commits/{sha}", params={"stat": "false", "files": "false"})
+        return r.status_code == 200
+
+    def push_url(self, name: str) -> str:
+        """Адрес для git push с токеном внутри. Токен в выводе git прячется."""
+        scheme, rest = CFG["FORGEJO_URL"].rstrip("/").split("://", 1)
+        return f"{scheme}://{CFG['FORGEJO_TOKEN']}@{rest}/{self.org}/{name}.git"
+
     async def default_branch(self, name: str) -> str:
         return (await self.repo(name))["default_branch"]
 

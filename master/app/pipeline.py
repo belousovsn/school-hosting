@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import posixpath
 import re
 import time
@@ -13,15 +14,27 @@ from urllib.parse import urlparse
 from . import db
 import httpx
 
-from .analyze import BOT_TYPES, analyze, contract_toml, norm_pkg, parse_requirements, resolve
+from .analyze import BOT_TYPES, analyze, contract_toml, needed_for_analysis, norm_pkg, parse_requirements, resolve
 from .checks import MAX_SCAN, check_push, is_text, verdict
 from .clients import CFG, Coolify, Docker, Forgejo, Telegram, notify
+from . import sync as gitsync
 
 fj, cf, dk = Forgejo(), Coolify(), Docker()
 
 CPU_LIMIT_SHARE = 0.9   # считаем "упёрся в лимит" от 90% лимита
 CPU_MINUTES = 10        # столько минут подряд до остановки
 _cpu_strikes: dict[int, int] = {}
+
+
+SYNC_MINUTES = int(os.environ.get("SYNC_MINUTES", "3"))  # как часто спрашивать GitHub о новых коммитах
+_sync_locks: dict[int, asyncio.Lock] = {}
+_sync_errors: dict[int, str] = {}
+
+
+def is_external(url: str) -> bool:
+    """Проект подключён не из нашего Forgejo, а снаружи (GitHub и т. п.)."""
+    u = urlparse((url or "").strip())
+    return u.scheme in ("http", "https") and bool(u.hostname) and u.hostname != urlparse(CFG["FORGEJO_URL"]).hostname
 
 
 def repo_name_from_url(url: str) -> tuple[str, bool]:
@@ -39,9 +52,7 @@ def repo_name_from_url(url: str) -> tuple[str, bool]:
 async def _read_for_analysis(repo: str, ref: str) -> tuple[list[str], dict[str, str]]:
     tree = await fj.tree(repo, ref)
     paths = [e["path"] for e in tree if e["type"] == "blob"]
-    wanted = [e["path"] for e in tree if e["type"] == "blob" and e.get("size", 0) <= 300_000 and (
-        e["path"].endswith((".py", ".env", ".json", ".cfg", ".ini", ".js", ".mjs", ".cjs", ".ts"))
-        or posixpath.basename(e["path"]) in ("requirements.txt", "school.toml"))]
+    wanted = [e["path"] for e in tree if e["type"] == "blob" and e.get("size", 0) <= 300_000 and needed_for_analysis(e["path"])]
     contents = await asyncio.gather(*(fj.raw(repo, p, ref) for p in wanted))
     return paths, {p: c.decode("utf-8", errors="replace") for p, c in zip(wanted, contents)}
 
@@ -108,8 +119,9 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
     uuid, url = await cf.create_app(d["repo"], d["branch"], c)
     for key in c["secrets"]:
         await cf.set_env(uuid, key, secrets[key].strip())
-    pid = db.run("INSERT INTO projects (repo, app_uuid, type, branch, url, created) VALUES (?,?,?,?,?,?)",
-                 d["repo"], uuid, c["type"], d["branch"], url, time.time())
+    source = d["source"] if is_external(d["source"]) else ""
+    pid = db.run("INSERT INTO projects (repo, app_uuid, type, branch, url, source, created) VALUES (?,?,?,?,?,?,?)",
+                 d["repo"], uuid, c["type"], d["branch"], url, source, time.time())
     db.event(pid, "info", "Проект подключён." + (f" Адрес: {url}." if url else "") + (" " + " ".join(notes) if notes else ""))
     db.run("DELETE FROM drafts WHERE id=?", draft_id)
     await handle_push(pid, sha)
@@ -117,8 +129,19 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
     return pid, []
 
 
+_push_locks: dict[int, asyncio.Lock] = {}
+
+
 async def handle_push(project_id: int, sha: str, force: bool = False):
+    # Один и тот же коммит может прийти и вебхуком, и от синхронизации с GitHub. Обрабатываем по очереди.
+    async with _push_locks.setdefault(project_id, asyncio.Lock()):
+        await _handle_push(project_id, sha, force)
+
+
+async def _handle_push(project_id: int, sha: str, force: bool):
     p = db.one("SELECT * FROM projects WHERE id=?", project_id)
+    if not p:
+        return
     if not force and p["last_sha"] == sha and p["status"] in ("deploying", "running"):
         return  # этот коммит уже проверен и собирается
     tree = await fj.tree(p["repo"], sha)
@@ -253,6 +276,57 @@ async def delete_project(pid: int):
     db.run("DELETE FROM projects WHERE id=?", pid)
     _progress.pop(pid, None)
     _cpu_strikes.pop(pid, None)
+
+
+async def project_source(p: dict) -> str:
+    """Откуда подключён проект. У старых проектов адрес берём из Forgejo и запоминаем."""
+    if p.get("source"):
+        return p["source"]
+    repo = await fj.repo(p["repo"]) or {}
+    src = repo.get("original_url") or ""
+    if is_external(src):
+        db.run("UPDATE projects SET source=? WHERE id=?", src, p["id"])
+        return src
+    return ""
+
+
+async def check_github(pid: int) -> str:
+    """Забирает новые коммиты из GitHub, если они есть. Возвращает текст для учителя."""
+    async with _sync_locks.setdefault(pid, asyncio.Lock()):
+        p = db.one("SELECT * FROM projects WHERE id=?", pid)
+        if not p:
+            return ""
+        src = await project_source(p)
+        if not src:
+            return "Проект подключён не из GitHub, обновлять нечего."
+        head = await gitsync.remote_head(src, p["branch"])
+        if head == p["source_sha"]:
+            return "Нового в GitHub нет."
+        if not p["source_sha"] and await fj.has_commit(p["repo"], head):
+            # Проект подключён до появления синхронизации: этот коммит уже в копии.
+            db.run("UPDATE projects SET source_sha=? WHERE id=?", head, pid)
+            return "Нового в GitHub нет."
+        res = await gitsync.sync(src, fj.push_url(p["repo"]), p["branch"], hide=CFG["FORGEJO_TOKEN"])
+        db.run("UPDATE projects SET source_sha=? WHERE id=?", res["src_sha"], pid)
+        db.event(pid, "info", f"Из GitHub пришёл коммит {res['src_sha'][:8]} «{res['subject'][:120]}».")
+    await handle_push(pid, res["dst_sha"])
+    return f"Забрал из GitHub коммит {res['src_sha'][:8]} «{res['subject'][:80]}»."
+
+
+async def github_watcher():
+    """Раз в несколько минут проверяет GitHub у всех проектов, кроме остановленных."""
+    while True:
+        await asyncio.sleep(SYNC_MINUTES * 60)
+        for p in db.all_("SELECT * FROM projects WHERE status != 'stopped'"):
+            try:
+                await check_github(p["id"])
+                if _sync_errors.pop(p["id"], None):
+                    db.event(p["id"], "info", "Связь с GitHub восстановилась.")
+            except Exception as e:  # одна ошибка не должна останавливать проверку остальных
+                msg = f"Не получилось забрать код из GitHub: {e}"
+                if _sync_errors.get(p["id"]) != msg:  # одну и ту же ошибку пишем в журнал один раз
+                    _sync_errors[p["id"]] = msg
+                    db.event(p["id"], "warn", msg)
 
 
 async def cpu_monitor():

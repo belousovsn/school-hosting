@@ -94,6 +94,12 @@ def _shallowest(paths: list[str]) -> list[str]:
     return sorted(paths, key=lambda p: (p.count("/"), p))
 
 
+def needed_for_analysis(path: str) -> bool:
+    """Файлы, которые нужно прочитать, чтобы разобрать проект."""
+    return path.endswith((".py", ".env", ".json", ".cfg", ".ini", ".js", ".mjs", ".cjs", ".ts")) \
+        or posixpath.basename(path) in ("requirements.txt", "school.toml")
+
+
 def detect_runtime(paths: list[str]) -> list[str]:
     """Какие среды есть в репозитории, по порядку предпочтения."""
     found = []

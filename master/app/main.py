@@ -45,9 +45,10 @@ def auth(cred: HTTPBasicCredentials = Depends(security)):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(pipeline.cpu_monitor())
+    tasks = [asyncio.create_task(pipeline.cpu_monitor()), asyncio.create_task(pipeline.github_watcher())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -293,6 +294,10 @@ def project_live(p: dict) -> str:
     if p.get("url"):
         body += f'<br>Сайт: <a href="{escape(p["url"])}" target="_blank">{escape(p["url"])}</a>'
     body += f'<br>Последний коммит: <code>{escape((p["last_sha"] or "")[:8])}</code>'
+    if p.get("source"):
+        got = f', последний забранный коммит <code>{escape(p["source_sha"][:8])}</code>' if p.get("source_sha") else ""
+        body += f'<br>Код берётся из <a href="{escape(p["source"])}" target="_blank">{escape(p["source"])}</a>, ' \
+                f'новые коммиты проверяю раз в {pipeline.SYNC_MINUTES} мин{got}.'
     if p["status"] == "deploying":
         pr = pipeline.progress(pid)
         if pr:
@@ -324,13 +329,23 @@ async def _project(pid: int) -> dict:
 @app.get("/projects/{pid}", dependencies=[Depends(auth)])
 async def project(pid: int, msg: str = ""):
     p = await _project(pid)
+    try:
+        await pipeline.project_source(p)  # у старых проектов узнаём, что они из GitHub
+    except ApiError:
+        pass
+    p = db.one("SELECT * FROM projects WHERE id=?", pid) | {"status": p["status"]}
     every = POLL.get(p["status"], POLL_IDLE)
     body = f'<div data-live="/live/projects/{pid}" data-every="{every}">{project_live(p)}</div>'
+    github = ""
+    if p.get("source"):
+        github = f"""<form class="inline" method="post" action="/projects/{pid}/github" data-busy="Забираю код из GitHub…"><button>Обновить из GitHub</button></form>
+"""
+    note = '<p class="muted hint">Изменения, отправленные прямо в Forgejo, перезапишутся при следующем обновлении из GitHub.</p>' if p.get("source") else ""
     body += f"""<p class="muted live-note" id="live-note">Состояние обновляется само.</p>
-<div class="card">
-<form class="inline" method="post" action="/projects/{pid}/redeploy" data-busy="Проверяю код…"><button>Проверить и пересобрать</button></form>
+<div class="card">{github}
+<form class="inline" method="post" action="/projects/{pid}/redeploy" data-busy="Проверяю код…"><button{' class="ghost"' if github else ''}>Проверить и пересобрать</button></form>
 <form class="inline" method="post" action="/projects/{pid}/stop" data-busy="Останавливаю…"><button class="ghost">Остановить</button></form>
-<form class="inline" method="post" action="/projects/{pid}/start" data-busy="Запускаю…"><button class="ghost">Запустить</button></form></div>
+<form class="inline" method="post" action="/projects/{pid}/start" data-busy="Запускаю…"><button class="ghost">Запустить</button></form>{note}</div>
 <div class="card"><b>Обновить секрет</b><form method="post" action="/projects/{pid}/secret" data-busy="Сохраняю и перезапускаю…">
 <label>Имя<input type="text" name="key" value="BOT_TOKEN"></label><label>Значение<input type="password" name="value" autocomplete="off"></label>
 <button class="ghost">Сохранить и перезапустить</button></form></div>
@@ -400,6 +415,18 @@ async def secret(pid: int, key: str = Form(...), value: str = Form(...)):
     db.event(pid, "info", f"Секрет {key} обновлён.")
     await pipeline.handle_push(pid, await _head(p), force=True)
     return go(f"/projects/{pid}", f"Секрет {key} сохранён. " + _after_push(pid))
+
+
+@app.post("/projects/{pid}/github", dependencies=[Depends(auth)])
+async def github(pid: int):
+    try:
+        msg = await pipeline.check_github(pid)
+    except Exception as e:
+        msg = f"Не получилось забрать код из GitHub: {e}"
+        db.event(pid, "warn", msg)
+        return go(f"/projects/{pid}", msg)
+    extra = _after_push(pid) if msg.startswith("Забрал") else ""
+    return go(f"/projects/{pid}", f"{msg} {extra}".strip())
 
 
 @app.post("/projects/{pid}/delete", dependencies=[Depends(auth)])

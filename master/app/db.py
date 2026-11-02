@@ -30,8 +30,9 @@ def conn() -> sqlite3.Connection:
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
     cols = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
-    if "url" not in cols:  # база первой версии
-        c.execute("ALTER TABLE projects ADD COLUMN url TEXT DEFAULT ''")
+    for col in ("url", "source", "source_sha"):  # колонки, появившиеся после первой версии
+        if col not in cols:
+            c.execute(f"ALTER TABLE projects ADD COLUMN {col} TEXT DEFAULT ''")
     return c
 
 
