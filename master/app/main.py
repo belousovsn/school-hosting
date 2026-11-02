@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -20,6 +21,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from . import db, pipeline
 from .analyze import BOT_TYPES, TYPES, WEB_TYPES
 from .clients import CFG, ApiError, Telegram, site_url
+
+AUTHOR_EMAIL = "master@school.local"  # от этого имени мастер коммитит настройки
 
 
 def parse_users(main_user: str, main_password: str, extra: str) -> dict[str, str]:
@@ -133,7 +136,7 @@ def page(title: str, body: str, msg: str = "") -> HTMLResponse:
     flash = f'<div class="card flash">{escape(msg)}</div>' if msg else ""
     return HTMLResponse(f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)}</title><style>{CSS}</style></head>
-<body><main><nav><a href="/">Проекты</a> · <a href="/connect">Подключить проект</a></nav><h1>{escape(title)}</h1>{flash}{body}</main>
+<body><main><nav><a href="/">Проекты</a> · <a href="/connect">Подключить проект</a> · <a href="/databases">Базы данных</a></nav><h1>{escape(title)}</h1>{flash}{body}</main>
 <script>{JS}</script></body></html>""")
 
 
@@ -173,7 +176,7 @@ def project_rows(projects: list[dict]) -> str:
     for p in projects:
         link = f'<a href="{escape(p["url"])}" target="_blank">открыть</a>' if p.get("url") else ""
         kind = TYPES.get(p["type"], p["type"] or "")
-        out += f'<tr><td><a href="/projects/{p["id"]}">{escape(p["repo"])}</a></td><td>{escape(kind)}</td><td>{status_badge(p, short=True)}</td><td>{link}</td></tr>'
+        out += f'<tr><td><a href="/projects/{p["id"]}">{escape(p["name"])}</a></td><td>{escape(kind)}</td><td>{status_badge(p, short=True)}</td><td>{link}</td></tr>'
     return out
 
 
@@ -217,12 +220,42 @@ async def connect(url: str = Form(...)):
     return RedirectResponse(f"/drafts/{did}", 303)
 
 
+def parts_body(d: dict, a: dict) -> str:
+    taken = set(a.get("taken", []))
+    out = f'<div class="card"><b>{escape(d["repo"])}</b> <span class="muted">из {escape(d["source"])}</span>'
+    out += '<p>В репозитории несколько частей. Каждая подключается отдельным проектом со своим адресом. Какую подключить сейчас?</p>'
+    for part in a["parts"]:
+        if part in taken:
+            out += f'<p><code>{escape(part)}/</code> <span class="ok">уже подключена</span></p>'
+        else:
+            out += (f'<form method="post" action="/drafts/{d["id"]}/part" data-busy="Разбираю {escape(part)}…">'
+                    f'<input type="hidden" name="subdir" value="{escape(part)}"><button class="ghost">Подключить {escape(part)}/</button></form> ')
+    return out + "</div>"
+
+
+def db_card(a: dict) -> str:
+    """Выбор базы данных при подключении. По умолчанию базы нет, если код её не просит."""
+    dbs = db.all_("SELECT * FROM databases ORDER BY id")
+    wants = a.get("wants_db")
+    hint = "Код работает с базой данных (нашёл DATABASE_URL или библиотеку для PostgreSQL)." if wants else \
+        "Код не похож на работу с базой. Если она всё же нужна, её можно подключить и позже на странице проекта."
+    opts = [("none", "Без базы данных", not wants), ("new", "Создать новую базу PostgreSQL", wants)]
+    opts += [(f"existing:{x['id']}", f"Общая база {x['name']} (как у " + (", ".join(u["name"] for u in db.all_("SELECT name FROM projects WHERE db_id=?", x["id"])) or "никого") + ")", False) for x in dbs]
+    out = f'<div class="card"><b>База данных</b><p class="muted">{hint} Адрес базы программа получит в переменной <code>DATABASE_URL</code>. Копия базы делается каждую ночь.</p>'
+    out += "".join(f'<label><input type="radio" name="q_db" value="{v}" {"checked" if c else ""}> {escape(label)}</label>' for v, label, c in opts)
+    return out + "</div>"
+
+
 def draft_body(d: dict, errors: list[str] | None = None) -> str:
     a = json.loads(d["analysis"])
-    out = f'<div class="card"><b>{escape(d["repo"])}</b> <span class="muted">из {escape(d["source"])}</span><br>'
+    if a["type"] == "parts":
+        return parts_body(d, a) + (f'<div class="card"><b class="bad">Не получилось</b>{items(errors, "bad")}</div>' if errors else "")
+    name = a.get("name") or d["repo"]
+    part = f' <span class="muted">· часть {escape(a["subdir"])}/</span>' if a.get("subdir") else ""
+    out = f'<div class="card"><b>{escape(name)}</b>{part} <span class="muted">из {escape(d["source"])}</span><br>'
     out += f'Тип: {escape(TYPES.get(a["type"], a["type"]))}' + (f' ({escape(a["framework"])})' if a.get("framework") else "")
     if a["type"] in WEB_TYPES:
-        out += f'<br>Адрес будет: <code>{escape(site_url(d["repo"]))}</code>'
+        out += f'<br>Адрес будет: <code>{escape(site_url(name))}</code>'
     out += "</div>"
     if errors:
         out += f'<div class="card"><b class="bad">Не получилось</b>{items(errors, "bad")}</div>'
@@ -249,6 +282,7 @@ def draft_body(d: dict, errors: list[str] | None = None) -> str:
         out += f'<div class="card"><b>Секреты</b><p class="muted">Хранятся только на сервере, в репозиторий не попадают.{tg_note}</p>'
         out += "".join(f'<label>{escape(s)}<input type="password" name="s_{escape(s)}" autocomplete="off" required></label>' for s in a["secrets"])
         out += "</div>"
+    out += db_card(a)
     out += '''<button>Подключить и запустить</button>
 <p class="hint muted" hidden>Проверяю токен, сохраняю настройки в репозиторий и создаю приложение на сервере. Это 10–20 секунд, потом откроется страница проекта, где будет видно, как идёт сборка.</p></form>'''
     return out
@@ -264,10 +298,22 @@ async def draft(did: int):
 
 @app.post("/drafts/{did}/recheck", dependencies=[Depends(auth)])
 async def draft_recheck(did: int):
-    d = db.one("SELECT * FROM drafts WHERE id=?", did)
-    db.run("DELETE FROM drafts WHERE id=?", did)
-    new = await pipeline.start_connect(d["source"])
-    return RedirectResponse(f"/drafts/{new}", 303)
+    try:
+        await pipeline.reanalyze_draft(did)
+    except (ValueError, ApiError) as e:
+        d = db.one("SELECT * FROM drafts WHERE id=?", did)
+        return page("Подключение проекта", draft_body(d, [str(e)]))
+    return RedirectResponse(f"/drafts/{did}", 303)
+
+
+@app.post("/drafts/{did}/part", dependencies=[Depends(auth)])
+async def draft_part(did: int, subdir: str = Form(...)):
+    try:
+        await pipeline.reanalyze_draft(did, subdir=subdir)
+    except (ValueError, ApiError) as e:
+        d = db.one("SELECT * FROM drafts WHERE id=?", did)
+        return page("Подключение проекта", draft_body(d, [str(e)]))
+    return RedirectResponse(f"/drafts/{did}", 303)
 
 
 @app.post("/drafts/{did}", dependencies=[Depends(auth)])
@@ -319,6 +365,23 @@ def project_live(p: dict) -> str:
     return body
 
 
+def project_db_card(p: dict) -> str:
+    pid = p["id"]
+    if p.get("db_id"):
+        base = db.one("SELECT * FROM databases WHERE id=?", p["db_id"]) or {"name": "?"}
+        others = [x["name"] for x in db.all_("SELECT name FROM projects WHERE db_id=? AND id!=?", p["db_id"], pid)]
+        shared = f" Эту же базу используют: {escape(', '.join(others))}." if others else ""
+        return (f'<div class="card"><b>База данных</b><p>Подключена база <code>{escape(base["name"])}</code>, адрес в переменной '
+                f'<code>DATABASE_URL</code>.{shared} Копия делается каждую ночь, хранятся 7 последних.</p></div>')
+    dbs = db.all_("SELECT * FROM databases ORDER BY id")
+    opts = '<option value="new">Создать новую базу PostgreSQL</option>' + "".join(
+        f'<option value="existing:{x["id"]}">Общая база {escape(x["name"])}</option>' for x in dbs)
+    return (f'<div class="card"><b>База данных</b><p class="muted">Не подключена. После подключения программа получит адрес базы '
+            f'в переменной <code>DATABASE_URL</code> и перезапустится.</p>'
+            f'<form method="post" action="/projects/{pid}/db" data-busy="Подключаю базу…"><select name="choice">{opts}</select> '
+            f'<button class="ghost">Подключить базу</button></form></div>')
+
+
 async def _project(pid: int) -> dict:
     p = db.one("SELECT * FROM projects WHERE id=?", pid)
     if not p:
@@ -346,13 +409,14 @@ async def project(pid: int, msg: str = ""):
 <form class="inline" method="post" action="/projects/{pid}/redeploy" data-busy="Проверяю код…"><button{' class="ghost"' if github else ''}>Проверить и пересобрать</button></form>
 <form class="inline" method="post" action="/projects/{pid}/stop" data-busy="Останавливаю…"><button class="ghost">Остановить</button></form>
 <form class="inline" method="post" action="/projects/{pid}/start" data-busy="Запускаю…"><button class="ghost">Запустить</button></form>{note}</div>
+{project_db_card(p)}
 <div class="card"><b>Обновить секрет</b><form method="post" action="/projects/{pid}/secret" data-busy="Сохраняю и перезапускаю…">
 <label>Имя<input type="text" name="key" value="BOT_TOKEN"></label><label>Значение<input type="password" name="value" autocomplete="off"></label>
 <button class="ghost">Сохранить и перезапустить</button></form></div>
-<div class="card"><b>Удалить проект</b><p class="muted">Приложение и его данные на сервере удалятся. Код останется в Forgejo, проект можно будет подключить заново.</p>
-<form method="post" action="/projects/{pid}/delete" data-busy="Удаляю…" data-confirm="Удалить проект {escape(p['repo'])} с сервера?">
+<div class="card"><b>Удалить проект</b><p class="muted">Приложение на сервере удалится. Код останется в Forgejo, база данных тоже останется, проект можно будет подключить заново.</p>
+<form method="post" action="/projects/{pid}/delete" data-busy="Удаляю…" data-confirm="Удалить проект {escape(p['name'])} с сервера?">
 <button class="danger">Удалить с сервера</button></form></div>"""
-    return page(p["repo"], body, msg)
+    return page(p["name"], body, msg)
 
 
 @app.get("/live/projects/{pid}", dependencies=[Depends(auth)])
@@ -429,13 +493,54 @@ async def github(pid: int):
     return go(f"/projects/{pid}", f"{msg} {extra}".strip())
 
 
+@app.post("/projects/{pid}/db", dependencies=[Depends(auth)])
+async def project_db(pid: int, choice: str = Form(...)):
+    try:
+        db_id = await pipeline.create_database(db.one("SELECT name FROM projects WHERE id=?", pid)["name"]) if choice == "new" \
+            else int(choice.split(":")[1])
+        await pipeline.attach_database(pid, db_id)
+    except (ValueError, ApiError, IndexError) as e:
+        return go(f"/projects/{pid}", f"Базу подключить не получилось: {e}")
+    return go(f"/projects/{pid}", "База данных подключена, проект перезапускается.")
+
+
+@app.get("/databases", dependencies=[Depends(auth)])
+async def databases(msg: str = ""):
+    rows = ""
+    for x in db.all_("SELECT * FROM databases ORDER BY id DESC"):
+        users = db.all_("SELECT id, name FROM projects WHERE db_id=?", x["id"])
+        try:
+            st = await pipeline.cf.database_status(x["uuid"])
+        except ApiError:
+            st = "?"
+        state = '<span class="ok">Работает</span>' if st.startswith("running") else f'<span class="muted">{escape(st)}</span>'
+        who = ", ".join(f'<a href="/projects/{u["id"]}">{escape(u["name"])}</a>' for u in users) or '<span class="muted">никто</span>'
+        delete = "" if users else (f'<form method="post" action="/databases/{x["id"]}/delete" data-busy="Удаляю…" '
+                                   f'data-confirm="Удалить базу {escape(x["name"])} вместе со всеми данными и копиями?"><button class="danger">Удалить</button></form>')
+        rows += f'<tr><td><code>{escape(x["name"])}</code></td><td>{state}</td><td>{who}</td><td>{delete}</td></tr>'
+    body = ('<div class="card"><p class="muted">Базы PostgreSQL для проектов. Одну базу можно подключить к нескольким проектам, например к боту и сайту. '
+            'Копия каждой базы делается каждую ночь, хранятся 7 последних. Удалить можно только базу, которой никто не пользуется.</p>')
+    body += (f'<table><tr><th>База</th><th>Состояние</th><th>Кто пользуется</th><th></th></tr>{rows}</table></div>' if rows
+             else 'Пока ни одной базы. Её можно создать при подключении проекта или на странице проекта.</div>')
+    return page("Базы данных", body, msg)
+
+
+@app.post("/databases/{db_id}/delete", dependencies=[Depends(auth)])
+async def database_delete(db_id: int):
+    try:
+        await pipeline.delete_database(db_id)
+    except (ValueError, ApiError) as e:
+        return go("/databases", str(e))
+    return go("/databases", "База удалена.")
+
+
 @app.post("/projects/{pid}/delete", dependencies=[Depends(auth)])
 async def delete(pid: int):
     p = db.one("SELECT * FROM projects WHERE id=?", pid)
     if not p:
         return go("/")
     await pipeline.delete_project(pid)
-    return go("/", f"Проект {p['repo']} удалён с сервера. Код остался в Forgejo.")
+    return go("/", f"Проект {p['name']} удалён с сервера. Код остался в Forgejo.")
 
 
 @app.post("/hooks/forgejo")
@@ -447,11 +552,23 @@ async def forgejo_hook(request: Request):
         raise HTTPException(403, "bad signature")
     data = json.loads(body)
     repo = data.get("repository", {}).get("name")
-    p = db.one("SELECT * FROM projects WHERE repo=?", repo)
-    if not p or data.get("ref") != f"refs/heads/{p['branch']}" or not data.get("after"):
-        return {"ignored": True}
-    asyncio.create_task(pipeline.handle_push(p["id"], data["after"]))
-    return {"queued": True}
+    queued = []
+    for p in db.all_("SELECT * FROM projects WHERE repo=?", repo):
+        if data.get("ref") != f"refs/heads/{p['branch']}" or not data.get("after") or skip_for_part(p, data):
+            continue
+        asyncio.create_task(pipeline.handle_push(p["id"], data["after"]))
+        queued.append(p["name"])
+    return {"queued": queued} if queued else {"ignored": True}
+
+
+def skip_for_part(p: dict, data: dict) -> bool:
+    """Мастер, подключая новую часть, коммитит её настройки. Соседние части из-за этого пересобирать не нужно."""
+    folder = posixpath.dirname(p.get("contract_path") or "school.toml")
+    commits = data.get("commits") or []
+    if not folder or not commits or not all(c.get("author", {}).get("email") == AUTHOR_EMAIL for c in commits):
+        return False
+    changed = {f for c in commits for f in c.get("added", []) + c.get("modified", []) + c.get("removed", [])}
+    return not any(f.startswith(folder + "/") for f in changed)
 
 
 @app.get("/healthz")

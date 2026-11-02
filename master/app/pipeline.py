@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from . import db
 import httpx
 
-from .analyze import BOT_TYPES, analyze, contract_toml, needed_for_analysis, norm_pkg, parse_requirements, resolve
+from .analyze import BOT_TYPES, DB_ENV, analyze, contract_toml, find_parts, needed_for_analysis, norm_pkg, parse_requirements, resolve, scope
 from .checks import MAX_SCAN, check_push, is_text, verdict
 from .clients import CFG, Coolify, Docker, Forgejo, Telegram, notify
 from . import sync as gitsync
@@ -27,7 +27,7 @@ _cpu_strikes: dict[int, int] = {}
 
 
 SYNC_MINUTES = int(os.environ.get("SYNC_MINUTES", "3"))  # как часто спрашивать GitHub о новых коммитах
-_sync_locks: dict[int, asyncio.Lock] = {}
+_sync_locks: dict[str, asyncio.Lock] = {}  # по имени репозитория
 _sync_errors: dict[int, str] = {}
 
 
@@ -57,9 +57,38 @@ async def _read_for_analysis(repo: str, ref: str) -> tuple[list[str], dict[str, 
     return paths, {p: c.decode("utf-8", errors="replace") for p, c in zip(wanted, contents)}
 
 
-async def start_connect(url: str, runtime: str | None = None) -> int:
+def project_name(repo: str, subdir: str) -> str:
+    """Имя проекта: как у репозитория, а у части репозитория с добавкой папки (mathapp-site)."""
+    return repo if not subdir else re.sub(r"[^A-Za-z0-9_.-]", "-", f"{repo}-{subdir.strip('/')}")[:60]
+
+
+def contract_path_for(subdir: str) -> str:
+    return posixpath.join(subdir, "school.toml") if subdir else "school.toml"
+
+
+def _analyze_draft(repo: str, paths: list[str], files: dict[str, str], runtime: str | None, subdir: str | None) -> dict:
+    """Разбор проекта или части репозитория. subdir=None: учитель часть ещё не выбирал."""
+    taken = {posixpath.dirname(p["contract_path"] or "school.toml") for p in db.all_("SELECT contract_path FROM projects WHERE repo=?", repo)}
+    parts = find_parts(paths)
+    if subdir is None and parts:
+        return {"type": "parts", "parts": parts, "taken": sorted(taken & set(parts)), "problems": [], "warnings": [],
+                "questions": [], "secrets": [], "entry_candidates": [], "missing_packages": []}
+    subdir = (subdir or "").strip("/")
+    if subdir in taken:
+        raise ValueError(f"Часть {subdir} уже подключена." if subdir else f"Проект {repo} уже подключён.")
+    if subdir and subdir not in parts:
+        raise ValueError(f"В репозитории нет папки {subdir} с проектом.")
+    a = analyze(*scope(paths, files, subdir), runtime)
+    a["subdir"] = subdir
+    a["name"] = project_name(repo, subdir)
+    if db.one("SELECT id FROM projects WHERE name=?", a["name"]):
+        raise ValueError(f"Проект с именем {a['name']} уже есть.")
+    return a
+
+
+async def start_connect(url: str, runtime: str | None = None, subdir: str | None = None) -> int:
     name, ours = repo_name_from_url(url)
-    if db.one("SELECT id FROM projects WHERE repo=?", name):
+    if db.one("SELECT id FROM projects WHERE repo=? AND contract_path='school.toml'", name):
         raise ValueError(f"Проект {name} уже подключён.")
     if not await fj.repo(name):
         if ours:
@@ -68,20 +97,29 @@ async def start_connect(url: str, runtime: str | None = None) -> int:
     branch = await fj.default_branch(name)
     sha = await fj.head(name, branch)
     paths, files = await _read_for_analysis(name, sha)
-    analysis = analyze(paths, files, runtime)
+    analysis = _analyze_draft(name, paths, files, runtime, subdir)
     return db.run("INSERT INTO drafts (repo, source, branch, analysis, created) VALUES (?,?,?,?,?)",
                   name, url, branch, json.dumps(analysis, ensure_ascii=False), time.time())
+
+
+async def reanalyze_draft(draft_id: int, runtime: str | None = None, subdir: str | None = None):
+    """Разбирает черновик заново: учитель выбрал часть репозитория или другую среду."""
+    d = db.one("SELECT * FROM drafts WHERE id=?", draft_id)
+    old = json.loads(d["analysis"])
+    sha = await fj.head(d["repo"], d["branch"])
+    paths, files = await _read_for_analysis(d["repo"], sha)
+    new = _analyze_draft(d["repo"], paths, files, runtime, subdir if subdir is not None else old.get("subdir"))
+    db.run("UPDATE drafts SET analysis=? WHERE id=?", json.dumps(new, ensure_ascii=False), draft_id)
 
 
 async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], add_missing: bool) -> tuple[int | None, list[str]]:
     d = db.one("SELECT * FROM drafts WHERE id=?", draft_id)
     a = json.loads(d["analysis"])
+    if a["type"] == "parts":
+        return None, ["Сначала выбери, какую часть репозитория подключить."]
     # Учитель выбрал другую среду (например Node.js вместо Python): разбираем заново и показываем форму ещё раз.
     if answers.get("runtime") and answers["runtime"] != a.get("runtime"):
-        sha = await fj.head(d["repo"], d["branch"])
-        paths, files = await _read_for_analysis(d["repo"], sha)
-        new = analyze(paths, files, answers["runtime"])
-        db.run("UPDATE drafts SET analysis=? WHERE id=?", json.dumps(new, ensure_ascii=False), draft_id)
+        await reanalyze_draft(draft_id, runtime=answers["runtime"])
         return None, ["Тип проекта изменён. Проверь форму ещё раз и нажми «Подключить»."]
     if a["problems"]:
         return None, a["problems"]
@@ -89,6 +127,10 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
     if r["errors"]:
         return None, r["errors"]
     c = r["contract"]
+    subdir = a.get("subdir", "")
+    name = a.get("name") or d["repo"]
+    if subdir:  # пути в контракте считаются от корня репозитория
+        c["base_dir"] = posixpath.join(subdir, c["base_dir"]) if c["base_dir"] else subdir
     errors, notes = [], []
     for key in c["secrets"]:
         if not secrets.get(key):
@@ -96,11 +138,15 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
         elif "TOKEN" in key.upper() and c["type"] in BOT_TYPES:
             ok, msg = await Telegram.check_token(secrets[key].strip())
             (notes if ok else errors).append(msg)
+    db_choice = answers.get("db", "none")
+    if db_choice.startswith("existing:") and not db.one("SELECT id FROM databases WHERE id=?", int(db_choice.split(":")[1])):
+        errors.append("Выбранной базы данных уже нет.")
     if errors:
         return None, errors
 
     base = c["base_dir"]
-    files = {"school.toml": contract_toml(c)}
+    contract_path = contract_path_for(subdir)
+    files = {contract_path: contract_toml(c)}
     is_python = bool(c.get("python"))
     req_path = posixpath.join(base, "requirements.txt") if base else "requirements.txt"
     if is_python:
@@ -115,18 +161,52 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
             files[req_path] = old.rstrip("\n") + "\n" + "\n".join(add) + "\n"
 
     # Вебхук ставим после первой сборки, иначе этот коммит собрался бы дважды.
-    sha = await fj.commit_files(d["repo"], d["branch"], files, "Подготовка к запуску на школьном сервере")
-    uuid, url = await cf.create_app(d["repo"], d["branch"], c)
+    sha = await fj.commit_files(d["repo"], d["branch"], files, f"Подготовка к запуску на школьном сервере: {name}")
+    uuid, url = await cf.create_app(d["repo"], d["branch"], c, name=name)
     for key in c["secrets"]:
         await cf.set_env(uuid, key, secrets[key].strip())
     source = d["source"] if is_external(d["source"]) else ""
-    pid = db.run("INSERT INTO projects (repo, app_uuid, type, branch, url, source, created) VALUES (?,?,?,?,?,?,?)",
-                 d["repo"], uuid, c["type"], d["branch"], url, source, time.time())
+    pid = db.run("INSERT INTO projects (repo, name, app_uuid, type, branch, url, source, contract_path, created) VALUES (?,?,?,?,?,?,?,?,?)",
+                 d["repo"], name, uuid, c["type"], d["branch"], url, source, contract_path, time.time())
     db.event(pid, "info", "Проект подключён." + (f" Адрес: {url}." if url else "") + (" " + " ".join(notes) if notes else ""))
     db.run("DELETE FROM drafts WHERE id=?", draft_id)
+    if db_choice == "new":
+        await attach_database(pid, await create_database(name), redeploy=False)
+    elif db_choice.startswith("existing:"):
+        await attach_database(pid, int(db_choice.split(":")[1]), redeploy=False)
     await handle_push(pid, sha)
     await fj.set_master_hook(d["repo"])
     return pid, []
+
+
+async def create_database(name: str) -> int:
+    """Создаёт PostgreSQL для проекта. Возвращает номер базы в мастере."""
+    db_name = f"{name}-db"
+    if db.one("SELECT id FROM databases WHERE name=?", db_name):
+        db_name = f"{name}-db-{int(time.time())}"
+    uuid, url = await cf.create_postgres(db_name)
+    return db.run("INSERT INTO databases (name, uuid, url, created) VALUES (?,?,?,?)", db_name, uuid, url, time.time())
+
+
+async def attach_database(pid: int, db_id: int, redeploy: bool = True):
+    """Передаёт проекту адрес базы в переменной DATABASE_URL. Одну базу можно дать нескольким проектам."""
+    base = db.one("SELECT * FROM databases WHERE id=?", db_id)
+    p = db.one("SELECT * FROM projects WHERE id=?", pid)
+    await cf.set_env(p["app_uuid"], DB_ENV, base["url"])
+    db.run("UPDATE projects SET db_id=? WHERE id=?", db_id, pid)
+    db.event(pid, "info", f"Подключена база данных {base['name']}. Адрес передан программе в переменной {DB_ENV}.")
+    if redeploy:
+        await handle_push(pid, await fj.head(p["repo"], p["branch"]), force=True)
+
+
+async def delete_database(db_id: int):
+    users = db.all_("SELECT name FROM projects WHERE db_id=?", db_id)
+    if users:
+        raise ValueError("Базой пользуются проекты: " + ", ".join(u["name"] for u in users) + ". Сначала удали их.")
+    base = db.one("SELECT * FROM databases WHERE id=?", db_id)
+    if base:
+        await cf.delete_database(base["uuid"])
+        db.run("DELETE FROM databases WHERE id=?", db_id)
 
 
 _push_locks: dict[int, asyncio.Lock] = {}
@@ -149,7 +229,7 @@ async def _handle_push(project_id: int, sha: str, force: bool):
              and (is_text(e["path"]) or "." not in posixpath.basename(e["path"]) or e["path"] == "school.toml")]
     contents = await asyncio.gather(*(fj.raw(p["repo"], e["path"], sha) for e in blobs))
     cache = {e["path"]: c for e, c in zip(blobs, contents)}
-    findings = check_push(tree, lambda path: cache.get(path, b""))
+    findings = check_push(tree, lambda path: cache.get(path, b""), p["contract_path"] or "school.toml")
     v = verdict(findings)
     if v == "suspicious" and p["allowed_sha"] == sha:
         v = "ok"
@@ -161,7 +241,7 @@ async def _handle_push(project_id: int, sha: str, force: bool):
         db.event(project_id, "info", f"Коммит {sha[:8]} прошёл проверки, сборка запущена.")
     else:
         db.set_findings(project_id, sha, "blocked" if v == "block" else "suspicious", findings)
-        text = f"{p['repo']}: коммит {sha[:8]} не собран. " + " ".join(f["text"] for f in findings if f["level"] != "warn")
+        text = f"{p['name']}: коммит {sha[:8]} не собран. " + " ".join(f["text"] for f in findings if f["level"] != "warn")
         db.event(project_id, "error", text)
         await notify(text)
 
@@ -265,15 +345,16 @@ async def site_responds(url: str) -> bool:
 
 
 async def delete_project(pid: int):
-    """Убирает проект с сервера. Репозиторий в Forgejo остаётся, из него можно подключить проект заново."""
+    """Убирает проект с сервера. Репозиторий в Forgejo и база данных остаются."""
     p = db.one("SELECT * FROM projects WHERE id=?", pid)
     await cf.delete(p["app_uuid"])
-    try:
-        await fj.remove_hooks(p["repo"])
-    except Exception:
-        pass  # репозитория уже может не быть
     db.run("DELETE FROM events WHERE project_id=?", pid)
     db.run("DELETE FROM projects WHERE id=?", pid)
+    if not db.one("SELECT id FROM projects WHERE repo=?", p["repo"]):  # вебхук нужен, пока есть другие части
+        try:
+            await fj.remove_hooks(p["repo"])
+        except Exception:
+            pass  # репозитория уже может не быть
     _progress.pop(pid, None)
     _cpu_strikes.pop(pid, None)
 
@@ -285,17 +366,19 @@ async def project_source(p: dict) -> str:
     repo = await fj.repo(p["repo"]) or {}
     src = repo.get("original_url") or ""
     if is_external(src):
-        db.run("UPDATE projects SET source=? WHERE id=?", src, p["id"])
+        db.run("UPDATE projects SET source=? WHERE repo=?", src, p["repo"])
         return src
     return ""
 
 
 async def check_github(pid: int) -> str:
-    """Забирает новые коммиты из GitHub, если они есть. Возвращает текст для учителя."""
-    async with _sync_locks.setdefault(pid, asyncio.Lock()):
+    """Забирает новые коммиты из GitHub, если они есть. Возвращает текст для учителя.
+    Все части одного репозитория обновляются вместе."""
+    p = db.one("SELECT * FROM projects WHERE id=?", pid)
+    if not p:
+        return ""
+    async with _sync_locks.setdefault(p["repo"], asyncio.Lock()):
         p = db.one("SELECT * FROM projects WHERE id=?", pid)
-        if not p:
-            return ""
         src = await project_source(p)
         if not src:
             return "Проект подключён не из GitHub, обновлять нечего."
@@ -304,20 +387,29 @@ async def check_github(pid: int) -> str:
             return "Нового в GitHub нет."
         if not p["source_sha"] and await fj.has_commit(p["repo"], head):
             # Проект подключён до появления синхронизации: этот коммит уже в копии.
-            db.run("UPDATE projects SET source_sha=? WHERE id=?", head, pid)
+            db.run("UPDATE projects SET source_sha=? WHERE repo=?", head, p["repo"])
             return "Нового в GitHub нет."
-        res = await gitsync.sync(src, fj.push_url(p["repo"]), p["branch"], hide=CFG["FORGEJO_TOKEN"])
-        db.run("UPDATE projects SET source_sha=? WHERE id=?", res["src_sha"], pid)
-        db.event(pid, "info", f"Из GitHub пришёл коммит {res['src_sha'][:8]} «{res['subject'][:120]}».")
-    await handle_push(pid, res["dst_sha"])
+        parts = db.all_("SELECT * FROM projects WHERE repo=?", p["repo"])
+        res = await gitsync.sync(src, fj.push_url(p["repo"]), p["branch"], hide=CFG["FORGEJO_TOKEN"],
+                                 contract_paths=[s["contract_path"] or "school.toml" for s in parts])
+        db.run("UPDATE projects SET source_sha=? WHERE repo=?", res["src_sha"], p["repo"])
+        for s in parts:
+            db.event(s["id"], "info", f"Из GitHub пришёл коммит {res['src_sha'][:8]} «{res['subject'][:120]}».")
+    for s in parts:  # остановленные части сами не запускаем, кроме той, где учитель нажал кнопку
+        if s["status"] != "stopped" or s["id"] == pid:
+            await handle_push(s["id"], res["dst_sha"])
     return f"Забрал из GitHub коммит {res['src_sha'][:8]} «{res['subject'][:80]}»."
 
 
 async def github_watcher():
-    """Раз в несколько минут проверяет GitHub у всех проектов, кроме остановленных."""
+    """Раз в несколько минут проверяет GitHub у всех репозиториев, где есть работающие проекты."""
     while True:
         await asyncio.sleep(SYNC_MINUTES * 60)
-        for p in db.all_("SELECT * FROM projects WHERE status != 'stopped'"):
+        seen = set()
+        for p in db.all_("SELECT * FROM projects WHERE status != 'stopped' ORDER BY id"):
+            if p["repo"] in seen:
+                continue
+            seen.add(p["repo"])
             try:
                 await check_github(p["id"])
                 if _sync_errors.pop(p["id"], None):
@@ -349,10 +441,10 @@ async def cpu_monitor():
                     await cf.stop(p["app_uuid"])
                     db.run("UPDATE projects SET status='stopped' WHERE id=?", p["id"])
                     if restarts:
-                        text = (f"{p['repo']} остановлен: программа {CPU_MINUTES} минут падала и перезапускалась по кругу "
+                        text = (f"{p['name']} остановлен: программа {CPU_MINUTES} минут падала и перезапускалась по кругу "
                                 f"({restarts} перезапусков). Причина обычно в логе: неверный токен или ошибка в коде.")
                     else:
-                        text = f"{p['repo']} остановлен: {CPU_MINUTES} минут подряд упирался в лимит процессора. Так ведут себя майнеры и зависшие циклы."
+                        text = f"{p['name']} остановлен: {CPU_MINUTES} минут подряд упирался в лимит процессора. Так ведут себя майнеры и зависшие циклы."
                     db.event(p["id"], "error", text)
                     await notify(text)
                     _cpu_strikes.pop(p["id"], None)

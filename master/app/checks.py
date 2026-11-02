@@ -32,8 +32,9 @@ def is_text(path: str) -> bool:
     return path.endswith(TEXT_EXT) or posixpath.basename(path) in TEXT_NAMES
 
 
-def check_push(tree: list[dict], read) -> list[dict]:
-    """tree: [{path, type, size}], read(path) -> bytes. Возвращает список находок."""
+def check_push(tree: list[dict], read, contract_path: str = "school.toml") -> list[dict]:
+    """tree: [{path, type, size}], read(path) -> bytes. contract_path: где лежит описание этого проекта.
+    Возвращает список находок."""
     findings: list[dict] = []
     blobs = [e for e in tree if e.get("type") == "blob"]
     names = {e["path"] for e in blobs}
@@ -51,13 +52,13 @@ def check_push(tree: list[dict], read) -> list[dict]:
 
     # Контракт.
     contract = None
-    if "school.toml" not in names:
-        add("block", "contract", "Нет файла school.toml. Подключи проект через мастер.")
+    if contract_path not in names:
+        add("block", "contract", f"Нет файла {contract_path}. Подключи проект через мастер.")
     else:
         try:
-            contract = tomllib.loads(read("school.toml").decode("utf-8"))
+            contract = tomllib.loads(read(contract_path).decode("utf-8"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
-            add("block", "contract", f"school.toml не читается: {e}")
+            add("block", "contract", f"{contract_path} не читается: {e}")
     if contract:
         base = contract.get("base_dir", "") or ""
         kind = contract.get("type", "")

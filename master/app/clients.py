@@ -120,8 +120,10 @@ class Coolify:
             timeout=TIMEOUT,
         )
 
-    async def create_app(self, repo: str, branch: str, contract: dict) -> tuple[str, str]:
-        """Создаёт приложение под тип проекта. Возвращает (uuid, адрес сайта или '')."""
+    async def create_app(self, repo: str, branch: str, contract: dict, name: str | None = None) -> tuple[str, str]:
+        """Создаёт приложение под тип проекта. name: имя проекта, по умолчанию как у репозитория.
+        Возвращает (uuid, адрес сайта или '')."""
+        name = name or repo
         kind = contract["type"]
         web = kind in ("static", "python-web", "node-web")
         body = {
@@ -131,12 +133,12 @@ class Coolify:
             "git_branch": branch, "build_pack": "static" if kind == "static" else "nixpacks",
             "ports_exposes": str(contract.get("port") or (80 if kind == "static" else 3000)),
             "base_directory": "/" + (contract.get("base_dir") or "").strip("/"),
-            "name": repo, "instant_deploy": False,
+            "name": name, "instant_deploy": False,
         }
         if contract.get("start"):
             body["start_command"] = contract["start"]
         uuid = _check(await self.c.post("/applications/private-deploy-key", json=body)).json()["uuid"]
-        url = site_url(repo) if web else ""
+        url = site_url(name) if web else ""
         mem, cpu = LIMITS.get(kind, DEFAULT_LIMITS)
         await self.update_app(uuid, {"domains": url, "limits_memory": mem, "limits_cpus": cpu, "health_check_enabled": False})
         if kind.startswith("python") or kind == "telegram-bot":
@@ -178,6 +180,27 @@ class Coolify:
 
     async def start(self, uuid: str):
         _check(await self.c.post(f"/applications/{uuid}/start"))
+
+    async def create_postgres(self, name: str) -> tuple[str, str]:
+        """Создаёт PostgreSQL с ночной резервной копией. Возвращает (uuid, внутренний адрес для DATABASE_URL)."""
+        body = {"server_uuid": CFG["CF_SERVER_UUID"], "project_uuid": CFG["CF_PROJECT_UUID"],
+                "environment_name": "production", "name": name, "postgres_db": "app",
+                "limits_memory": "256m", "limits_cpus": "0.5", "instant_deploy": True}
+        d = _check(await self.c.post("/databases/postgresql", json=body)).json()
+        await self.c.post(f"/databases/{d['uuid']}/backups", json={
+            "frequency": "0 3 * * *", "enabled": True, "database_backup_retention_amount_locally": 7})
+        return d["uuid"], d["internal_db_url"]
+
+    async def delete_database(self, uuid: str):
+        r = await self.c.delete(f"/databases/{uuid}", params={
+            "delete_configurations": "true", "delete_volumes": "true",
+            "docker_cleanup": "true", "delete_connected_networks": "true"})
+        if r.status_code != 404:
+            _check(r)
+
+    async def database_status(self, uuid: str) -> str:
+        r = await self.c.get(f"/databases/{uuid}")
+        return "missing" if r.status_code == 404 else _check(r).json().get("status", "")
 
     async def delete(self, uuid: str):
         """Удаляет приложение вместе с контейнером и томами."""

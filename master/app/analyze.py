@@ -32,7 +32,12 @@ IMPORT_TO_PKG = {
     "telegram": "python-telegram-bot", "telebot": "pyTelegramBotAPI", "dotenv": "python-dotenv",
     "yaml": "PyYAML", "PIL": "Pillow", "bs4": "beautifulsoup4", "sklearn": "scikit-learn",
     "cv2": "opencv-python", "dateutil": "python-dateutil", "jwt": "PyJWT",
+    "psycopg2": "psycopg2-binary", "psycopg": "psycopg[binary]",
 }
+# Признаки того, что программе нужна база данных PostgreSQL.
+PY_DB_LIBS = {"psycopg", "psycopg2", "asyncpg", "sqlalchemy", "peewee", "tortoise", "databases"}
+NODE_DB_LIBS = {"pg", "postgres", "pg-promise", "@prisma/client", "prisma", "knex", "sequelize", "typeorm", "drizzle-orm"}
+DB_ENV = "DATABASE_URL"
 PY_BOT_LIBS = {"aiogram": "aiogram", "telegram": "python-telegram-bot", "telebot": "pyTelegramBotAPI"}
 PY_WEB_LIBS = {"fastapi": "FastAPI", "flask": "Flask", "django": "Django"}
 NODE_BOT_LIBS = {"telegraf", "grammy", "node-telegram-bot-api"}
@@ -67,7 +72,7 @@ def ignored(path: str) -> bool:
 
 
 def norm_pkg(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
+    return re.sub(r"[-_.]+", "-", name.split("[", 1)[0]).lower()
 
 
 def parse_requirements(text: str) -> set[str]:
@@ -87,7 +92,29 @@ def find_hardcoded_tokens(files: dict[str, str]) -> list[tuple[str, int]]:
 
 
 def _secrets(env_vars: list[str]) -> list[str]:
-    return [v for v in env_vars if any(w in v.upper() for w in SECRET_WORDS) and v != "PORT"]
+    # Адрес базы данных мастер передаёт сам, учителю его вводить не нужно.
+    return [v for v in env_vars if any(w in v.upper() for w in SECRET_WORDS) and v not in ("PORT", DB_ENV)]
+
+
+MARKERS = ("requirements.txt", "package.json", "index.html")
+
+
+def find_parts(paths: list[str]) -> list[str]:
+    """Папки первого уровня, где лежат отдельные проекты (например bot/ и site/).
+    Пусто, если в корне есть свой проект или папка с проектом одна."""
+    paths = [p for p in paths if not ignored(p)]
+    if any(p in MARKERS for p in paths):
+        return []
+    parts = sorted({p.split("/", 1)[0] for p in paths if "/" in p and posixpath.basename(p) in MARKERS})
+    return parts if len(parts) > 1 else []
+
+
+def scope(paths: list[str], files: dict[str, str], subdir: str) -> tuple[list[str], dict[str, str]]:
+    """Оставляет только файлы папки subdir, пути становятся относительными к ней."""
+    if not subdir:
+        return paths, files
+    pre = subdir.strip("/") + "/"
+    return [p[len(pre):] for p in paths if p.startswith(pre)], {p[len(pre):]: t for p, t in files.items() if p.startswith(pre)}
 
 
 def _shallowest(paths: list[str]) -> list[str]:
@@ -206,13 +233,14 @@ def _analyze_python(paths: list[str], files: dict[str, str], base: dict) -> dict
     tokens = find_hardcoded_tokens({p: t for p, t in files.items() if p.endswith((".py", ".env", ".json", ".toml", ".cfg", ".ini"))})
     _token_problems(kind, tokens, secrets, problems, "os.getenv(\"BOT_TOKEN\")")
 
+    wants_db = DB_ENV in env_vars or bool(imports & PY_DB_LIBS)
     data_paths = sorted({m for t in py.values() for m in SQLITE_RE.findall(t) + WRITE_RE.findall(t)})
     if data_paths:
-        warnings.append("Программа пишет в файлы (" + ", ".join(data_paths[:5]) + "). Сейчас они сбрасываются при каждом обновлении.")
+        warnings.append("Программа пишет в файлы (" + ", ".join(data_paths[:5]) + "). Они сбрасываются при каждом обновлении. Данные, которые надо хранить, лучше держать в базе данных.")
     return {"type": kind, "framework": framework, "entry_candidates": candidates, "req_candidates": reqs,
             "missing_packages": missing, "env_vars": env_vars, "secrets": secrets, "hardcoded_tokens": tokens,
             "data_paths": data_paths, "problems": problems, "warnings": warnings, "questions": questions,
-            "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
+            "wants_db": wants_db, "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
 
 
 def _analyze_node(paths: list[str], files: dict[str, str], base: dict) -> dict:
@@ -282,7 +310,7 @@ def _analyze_node(paths: list[str], files: dict[str, str], base: dict) -> dict:
     return {"type": kind, "framework": framework, "entry_candidates": candidates, "req_candidates": pkgs,
             "missing_packages": missing, "env_vars": env_vars, "secrets": secrets, "hardcoded_tokens": tokens,
             "data_paths": [], "problems": problems, "warnings": warnings, "questions": questions,
-            "has_start_script": has_start, "port": port}
+            "has_start_script": has_start, "port": port, "wants_db": DB_ENV in env_vars or bool((deps | used) & NODE_DB_LIBS)}
 
 
 def _token_problems(kind: str, tokens, secrets, problems: list[str], how: str):
