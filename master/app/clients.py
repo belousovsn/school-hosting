@@ -219,6 +219,15 @@ class Telegram:
             return r.json()
 
     @classmethod
+    async def token_alive(cls, token: str) -> bool:
+        """Действует ли токен. Если Telegram недоступен, считаем, что действует: так безопаснее."""
+        try:
+            me = await cls.call(token, "getMe")
+        except (httpx.HTTPError, ValueError):
+            return True
+        return bool(me.get("ok")) or me.get("error_code") != 401
+
+    @classmethod
     async def check_token(cls, token: str) -> tuple[bool, str]:
         """Проверяет токен и снимает старый webhook, который мешает polling."""
         me = await cls.call(token, "getMe")

@@ -15,7 +15,7 @@ from . import db
 import httpx
 
 from .analyze import BOT_TYPES, DB_ENV, analyze, contract_toml, find_parts, needed_for_analysis, norm_pkg, parse_requirements, resolve, scope
-from .checks import MAX_SCAN, check_push, is_text, verdict
+from .checks import check_push, find_tokens, scannable, verdict
 from .clients import CFG, Coolify, Docker, Forgejo, Telegram, notify
 from . import sync as gitsync
 
@@ -98,6 +98,8 @@ async def start_connect(url: str, runtime: str | None = None, subdir: str | None
     sha = await fj.head(name, branch)
     paths, files = await _read_for_analysis(name, sha)
     analysis = _analyze_draft(name, paths, files, runtime, subdir)
+    if analysis["type"] != "parts":
+        await _token_scan(name, sha, analysis.get("subdir", ""), analysis)
     return db.run("INSERT INTO drafts (repo, source, branch, analysis, created) VALUES (?,?,?,?,?)",
                   name, url, branch, json.dumps(analysis, ensure_ascii=False), time.time())
 
@@ -109,6 +111,8 @@ async def reanalyze_draft(draft_id: int, runtime: str | None = None, subdir: str
     sha = await fj.head(d["repo"], d["branch"])
     paths, files = await _read_for_analysis(d["repo"], sha)
     new = _analyze_draft(d["repo"], paths, files, runtime, subdir if subdir is not None else old.get("subdir"))
+    if new["type"] != "parts":
+        await _token_scan(d["repo"], sha, new.get("subdir", ""), new)
     db.run("UPDATE drafts SET analysis=? WHERE id=?", json.dumps(new, ensure_ascii=False), draft_id)
 
 
@@ -209,6 +213,50 @@ async def delete_database(db_id: int):
         db.run("DELETE FROM databases WHERE id=?", db_id)
 
 
+async def _read_scannable(repo: str, ref: str, tree: list[dict]) -> dict[str, bytes]:
+    """Читает из Forgejo все файлы, которые проверка смотрит целиком (текстовые до мегабайта)."""
+    sem = asyncio.Semaphore(16)
+
+    async def get(path: str) -> bytes:
+        async with sem:
+            return await fj.raw(repo, path, ref)
+
+    blobs = [e["path"] for e in tree if e["type"] == "blob" and e.get("size", 0) > 0 and scannable(e["path"], e.get("size", 0))]
+    contents = await asyncio.gather(*(get(path) for path in blobs))
+    return dict(zip(blobs, contents))
+
+
+async def _soften_revoked_tokens(findings: list[dict]):
+    """Отозванный в BotFather токен уже никому не опасен: сборку из-за него не останавливаем.
+    Сам токен из находок убираем, чтобы он не попал в базу мастера и на страницу."""
+    for f in findings:
+        token = f.pop("_token", None)
+        if token and not await Telegram.token_alive(token):
+            f["level"] = "warn"
+            f["text"] = f["text"].split(". ")[0] + ". Этот токен уже отозван, сборку не останавливаю, но строку стоит убрать из кода."
+
+
+async def _token_scan(repo: str, ref: str, subdir: str, analysis: dict):
+    """При подключении ищет токены во всех текстовых файлах, а не только в коде, который разбирает анализ."""
+    tree = await fj.tree(repo, ref)
+    cache = await _read_scannable(repo, ref, tree)
+    pre = subdir.strip("/") + "/" if subdir else ""
+    known = {path for path, _ in analysis.get("hardcoded_tokens", [])}
+    for path, data in cache.items():
+        if not path.startswith(pre) or path[len(pre):] in known or b"\0" in data[:8192]:
+            continue
+        found = find_tokens(data.decode("utf-8", errors="replace"))
+        if not found:
+            continue
+        line, token = found[0]
+        where = f"{path}:{line}"
+        if await Telegram.token_alive(token):
+            analysis["problems"].append(f"Токен бота записан в {where}. Репозиторий мог быть публичным, поэтому токен считается засвеченным: "
+                                        "сделай /revoke в @BotFather и убери строку из файла.")
+        else:
+            analysis["warnings"].append(f"В {where} записан токен бота. Он уже отозван, но строку стоит убрать из файла.")
+
+
 _push_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -225,11 +273,9 @@ async def _handle_push(project_id: int, sha: str, force: bool):
     if not force and p["last_sha"] == sha and p["status"] in ("deploying", "running"):
         return  # этот коммит уже проверен и собирается
     tree = await fj.tree(p["repo"], sha)
-    blobs = [e for e in tree if e["type"] == "blob" and e.get("size", 0) <= MAX_SCAN
-             and (is_text(e["path"]) or "." not in posixpath.basename(e["path"]) or e["path"] == "school.toml")]
-    contents = await asyncio.gather(*(fj.raw(p["repo"], e["path"], sha) for e in blobs))
-    cache = {e["path"]: c for e, c in zip(blobs, contents)}
+    cache = await _read_scannable(p["repo"], sha, tree)
     findings = check_push(tree, lambda path: cache.get(path, b""), p["contract_path"] or "school.toml")
+    await _soften_revoked_tokens(findings)
     v = verdict(findings)
     if v == "suspicious" and p["allowed_sha"] == sha:
         v = "ok"

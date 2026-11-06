@@ -17,7 +17,12 @@ MAX_FILE = 20 * 1024 * 1024
 MAX_REPO = 200 * 1024 * 1024
 MAX_SCAN = 1024 * 1024  # текстовые файлы больше мегабайта не читаем
 
-TEXT_EXT = (".py", ".txt", ".toml", ".json", ".yml", ".yaml", ".sh", ".cfg", ".ini", ".env", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".html")
+TEXT_EXT = (".py", ".txt", ".toml", ".json", ".yml", ".yaml", ".sh", ".cfg", ".ini", ".env", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".html",
+            ".bat", ".cmd", ".ps1")
+# Файлы, которые точно не текст: их не читаем. Всё остальное до мегабайта проверяем на токены.
+MEDIA_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".pdf", ".zip", ".gz", ".tgz", ".tar", ".7z", ".rar",
+             ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".mov", ".avi",
+             ".pyc", ".db", ".sqlite", ".sqlite3", ".jar", ".class", ".whl", ".psd", ".xlsx", ".docx", ".pptx")
 TEXT_NAMES = ("Dockerfile", "Procfile", "Makefile")
 BINARY_EXT = (".exe", ".so", ".elf", ".bin", ".dll", ".dylib")
 
@@ -30,6 +35,17 @@ SUSPICIOUS = [
 
 def is_text(path: str) -> bool:
     return path.endswith(TEXT_EXT) or posixpath.basename(path) in TEXT_NAMES
+
+
+def scannable(path: str, size: int) -> bool:
+    """Нужно ли читать файл при проверке: всё, кроме картинок, архивов и чужих библиотек."""
+    lower = path.lower()
+    return size <= MAX_SCAN and "node_modules/" not in path and not lower.endswith(MEDIA_EXT)
+
+
+def find_tokens(text: str) -> list[tuple[int, str]]:
+    """Токены Telegram-ботов в тексте: [(номер строки, токен)]."""
+    return [(i, m.group(0)) for i, line in enumerate(text.splitlines(), 1) for m in TG_TOKEN_RE.finditer(line)]
 
 
 def check_push(tree: list[dict], read, contract_path: str = "school.toml") -> list[dict]:
@@ -73,32 +89,34 @@ def check_push(tree: list[dict], read, contract_path: str = "school.toml") -> li
         if any(p.startswith(in_base("node_modules/")) for p in names):
             add("warn", "size", "В репозиторий попала папка node_modules. Её стоит удалить и добавить в .gitignore.")
 
-    # Содержимое.
+    # Содержимое. Токены ищем во всех текстовых файлах: токен в run_bot.bat утекает так же, как в bot.py.
     for e in blobs:
         path, size = e["path"], e.get("size", 0)
         if "node_modules/" in path:  # чужие библиотеки не сканируем, о самой папке уже предупредили
             continue
-        if path.endswith(BINARY_EXT):
+        if path.lower().endswith(BINARY_EXT):
             add("suspicious", "binary", f"В репозитории исполняемый файл {path}.")
             continue
-        if size > MAX_SCAN:
+        if not scannable(path, size) or size == 0:
             continue
-        if not is_text(path):
-            if "." not in posixpath.basename(path) and size > 0:
-                head = read(path)[:4]
-                if head == b"\x7fELF":
-                    add("suspicious", "binary", f"В репозитории исполняемый файл {path}.")
+        data = read(path)
+        if data[:4] == b"\x7fELF":
+            add("suspicious", "binary", f"В репозитории исполняемый файл {path}.")
             continue
-        text = read(path).decode("utf-8", errors="replace")
-        for i, line in enumerate(text.splitlines(), 1):
-            if TG_TOKEN_RE.search(line):
-                add("block", "token", f"Токен бота в {path}:{i}. Сделай /revoke в @BotFather, токен храни только в настройках проекта.")
-                break
-        for label, rx in SUSPICIOUS:
-            m = rx.search(text)
-            if m:
-                line_no = text.count("\n", 0, m.start()) + 1
-                add("suspicious", "forbidden", f"Похоже на {label}: {path}:{line_no} ({m.group(0)!r}).")
+        if b"\0" in data[:8192]:  # другой двоичный файл, токенов в нём не ищем
+            continue
+        text = data.decode("utf-8", errors="replace")
+        tokens = find_tokens(text)
+        if tokens:
+            line, token = tokens[0]
+            findings.append({"level": "block", "code": "token", "_token": token,
+                             "text": f"Токен бота в {path}:{line}. Сделай /revoke в @BotFather, токен храни только в настройках проекта."})
+        if is_text(path):
+            for label, rx in SUSPICIOUS:
+                m = rx.search(text)
+                if m:
+                    line_no = text.count("\n", 0, m.start()) + 1
+                    add("suspicious", "forbidden", f"Похоже на {label}: {path}:{line_no} ({m.group(0)!r}).")
     return findings
 
 
