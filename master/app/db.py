@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY, repo TEXT, name TEXT UNIQUE, app_uuid TEXT, type TEXT, branch TEXT,
   status TEXT DEFAULT 'new', last_sha TEXT, findings TEXT DEFAULT '[]', allowed_sha TEXT,
   last_deploy TEXT, created REAL, url TEXT DEFAULT '', source TEXT DEFAULT '', source_sha TEXT DEFAULT '',
-  contract_path TEXT DEFAULT 'school.toml', db_id INTEGER
+  contract_path TEXT DEFAULT 'school.toml', db_id INTEGER, data_dir TEXT DEFAULT ''
 );
 """
 SCHEMA = PROJECTS + """
@@ -46,6 +46,9 @@ def migrate(c: sqlite3.Connection):
         c.execute(f"INSERT INTO projects ({names}, name) SELECT {names}, repo FROM projects_old")
         c.execute("DROP TABLE projects_old")
     c.executescript(SCHEMA)
+    cols = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
+    if "data_dir" not in cols:  # колонка появилась вместе с постоянными папками
+        c.execute("ALTER TABLE projects ADD COLUMN data_dir TEXT DEFAULT ''")
 
 
 def conn() -> sqlite3.Connection:

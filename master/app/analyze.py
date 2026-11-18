@@ -67,6 +67,20 @@ PY_APP_RE = re.compile(r"^(\w+)\s*=\s*(Flask|FastAPI)\(", re.M)
 JS_IMPORT_RE = re.compile(r"""require\(\s*['"]([^'"./][^'"]*)['"]\s*\)|from\s+['"]([^'"./][^'"]*)['"]|import\s+['"]([^'"./][^'"]*)['"]""")
 JS_LISTEN_RE = re.compile(r"\.listen\(\s*(\d{2,5})")
 SQLITE_RE = re.compile(r"""sqlite3\.connect\(\s*['"]([^'"]+)['"]""")
+DB_FILE_RE = re.compile(r"""['"]((?:\./)?[\w.-]+(?:/[\w.-]+)*\.(?:db|sqlite3?))['"]""")  # "data/mafia.db"
+# Папки, которые нельзя делать постоянными: в них код или служебные файлы.
+NOT_DATA_DIRS = {"", ".", "app", "src", "templates", "static", "public", "node_modules", ".venv", "venv", "tests"}
+
+
+def find_data_dir(paths: list[str]) -> str:
+    """Папка с данными программы (data для data/mafia.db). Пусто, если файлы лежат в корне или путь абсолютный."""
+    for p in paths:
+        if p.startswith(("/", "~")) or ".." in p.split("/") or ":memory:" in p:
+            continue
+        top = posixpath.normpath(p).split("/")[0] if "/" in posixpath.normpath(p) else ""
+        if top and top not in NOT_DATA_DIRS:
+            return top
+    return ""
 WRITE_RE = re.compile(r"""open\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]""")
 SECRET_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASS")
 PY_ENTRY_NAMES = ("main.py", "bot.py", "app.py", "run.py", "server.py", "__main__.py")
@@ -265,14 +279,18 @@ def _analyze_python(paths: list[str], files: dict[str, str], base: dict) -> dict
     uses_sqlite = any("sqlite" in t for t in py.values())
     wants_db = DB_ENV in env_vars or bool(imports & PY_PG_DRIVERS) or (bool(imports & PY_ORMS) and not uses_sqlite)
     data_paths = sorted({m for t in py.values() for m in SQLITE_RE.findall(t) + WRITE_RE.findall(t)})
-    if data_paths:
-        warnings.append("Программа пишет в файлы (" + ", ".join(data_paths[:5]) + "). Они сбрасываются при каждом обновлении. Данные, которые надо хранить, лучше держать в базе данных.")
-    elif uses_sqlite:
-        warnings.append("Программа хранит данные в SQLite. Файл базы сбрасывается при каждом обновлении проекта: рейтинги и прогресс пропадут.")
+    db_files = sorted({m for t in py.values() for m in DB_FILE_RE.findall(t)})
+    data_dir = find_data_dir(data_paths + db_files)
+    if data_dir:
+        warnings.append(f"Программа хранит данные в папке {data_dir}/. Если оставить галочку ниже, папка сохранится между обновлениями.")
+    elif data_paths or db_files or uses_sqlite:
+        where = ", ".join((data_paths + db_files)[:5]) or "SQLite"
+        warnings.append(f"Программа хранит данные в файлах ({where}). Они сбрасываются при каждом обновлении. "
+                        "Чтобы данные сохранялись, положи их в папку, например data/, тогда мастер сделает её постоянной.")
     return {"type": kind, "framework": framework, "entry_candidates": candidates, "req_candidates": reqs,
             "missing_packages": missing, "env_vars": env_vars, "secrets": secrets, "hardcoded_tokens": tokens,
             "data_paths": data_paths, "problems": problems, "warnings": warnings, "questions": questions,
-            "wants_db": wants_db, "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
+            "wants_db": wants_db, "data_dir": data_dir, "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
 
 
 def _analyze_node(paths: list[str], files: dict[str, str], base: dict) -> dict:
@@ -387,6 +405,8 @@ def resolve(analysis: dict, answers: dict) -> dict:
     rel = posixpath.relpath(entry, base or ".")
     errors = [f"Файл запуска {entry} лежит вне папки с requirements.txt ({base or 'корень'})."] if rel.startswith("..") else []
     contract |= {"base_dir": base, "entry": rel, "python": "3.12"}
+    if answers.get("keep_data") and analysis.get("data_dir"):
+        contract["data_dir"] = analysis["data_dir"]
     if kind == "python-web":
         fw = analysis.get("framework")
         var = analysis.get("app_vars", {}).get(entry, "app")
@@ -414,5 +434,7 @@ def contract_toml(c: dict) -> str:
     ]
     if c.get("python"):
         lines.append(f'python = "{c["python"]}"')
+    if c.get("data_dir"):
+        lines.append(f'data_dir = "{c["data_dir"]}"   # папка с данными, сохраняется между обновлениями')
     lines.append(f"secrets = [{secrets}]   # значения хранятся только на сервере")
     return "\n".join(lines) + "\n"

@@ -276,6 +276,9 @@ def draft_body(d: dict, errors: list[str] | None = None) -> str:
         out += f'<p><label><input type="checkbox" name="add_missing" checked> Добавить в requirements.txt: <code>{escape(", ".join(a["missing_packages"]))}</code></label></p>'
     if a["warnings"]:
         out += f'<p class="warn">Обрати внимание:</p>{items(a["warnings"], "warn")}'
+    if a.get("data_dir"):
+        out += (f'<p><label><input type="checkbox" name="q_keep_data" checked> Сохранять папку <code>{escape(a["data_dir"])}/</code> '
+                'между обновлениями (рейтинги, прогресс и другие данные не пропадут)</label></p>')
     out += "</div>"
     if a["secrets"]:
         tg_note = " Токен бота проверю в Telegram." if a["type"] in BOT_TYPES else ""
@@ -365,6 +368,20 @@ def project_live(p: dict) -> str:
     return body
 
 
+def project_data_card(p: dict) -> str:
+    if p["type"] == "static":
+        return ""
+    if p.get("data_dir"):
+        return (f'<div class="card"><b>Постоянная папка</b><p>Папка <code>{escape(p["data_dir"])}/</code> сохраняется между обновлениями. '
+                'Она удалится только вместе с проектом.</p></div>')
+    return (f'<div class="card"><b>Постоянная папка</b><p class="muted">Нет. Всё, что программа пишет в файлы, пропадает при обновлении. '
+            'Если она хранит данные в папке (например SQLite в data/), эту папку можно сделать постоянной. Проект перезапустится, '
+            'файлы, которые сейчас лежат в папке, начнутся заново.</p>'
+            f'<form method="post" action="/projects/{p["id"]}/volume" data-busy="Подключаю папку…">'
+            '<label>Папка внутри проекта<input type="text" name="data_dir" value="data"></label>'
+            '<button class="ghost">Сделать постоянной</button></form></div>')
+
+
 def project_db_card(p: dict) -> str:
     pid = p["id"]
     if p.get("db_id"):
@@ -409,11 +426,12 @@ async def project(pid: int, msg: str = ""):
 <form class="inline" method="post" action="/projects/{pid}/redeploy" data-busy="Проверяю код…"><button{' class="ghost"' if github else ''}>Проверить и пересобрать</button></form>
 <form class="inline" method="post" action="/projects/{pid}/stop" data-busy="Останавливаю…"><button class="ghost">Остановить</button></form>
 <form class="inline" method="post" action="/projects/{pid}/start" data-busy="Запускаю…"><button class="ghost">Запустить</button></form>{note}</div>
+{project_data_card(p)}
 {project_db_card(p)}
 <div class="card"><b>Обновить секрет</b><form method="post" action="/projects/{pid}/secret" data-busy="Сохраняю и перезапускаю…">
 <label>Имя<input type="text" name="key" value="BOT_TOKEN"></label><label>Значение<input type="password" name="value" autocomplete="off"></label>
 <button class="ghost">Сохранить и перезапустить</button></form></div>
-<div class="card"><b>Удалить проект</b><p class="muted">Приложение на сервере удалится. Код останется в Forgejo, база данных тоже останется, проект можно будет подключить заново.</p>
+<div class="card"><b>Удалить проект</b><p class="muted">Приложение на сервере удалится вместе с постоянной папкой. Код останется в Forgejo, база данных PostgreSQL тоже останется, проект можно будет подключить заново.</p>
 <form method="post" action="/projects/{pid}/delete" data-busy="Удаляю…" data-confirm="Удалить проект {escape(p['name'])} с сервера?">
 <button class="danger">Удалить с сервера</button></form></div>"""
     return page(p["name"], body, msg)
@@ -491,6 +509,15 @@ async def github(pid: int):
         return go(f"/projects/{pid}", msg)
     extra = _after_push(pid) if msg.startswith("Забрал") else ""
     return go(f"/projects/{pid}", f"{msg} {extra}".strip())
+
+
+@app.post("/projects/{pid}/volume", dependencies=[Depends(auth)])
+async def project_volume(pid: int, data_dir: str = Form(...)):
+    try:
+        await pipeline.add_data_dir(pid, data_dir)
+    except (ValueError, ApiError) as e:
+        return go(f"/projects/{pid}", f"Папку подключить не получилось: {e}")
+    return go(f"/projects/{pid}", f"Папка {data_dir.strip().strip('/')}/ теперь постоянная, проект перезапускается.")
 
 
 @app.post("/projects/{pid}/db", dependencies=[Depends(auth)])

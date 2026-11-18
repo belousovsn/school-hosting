@@ -181,6 +181,13 @@ class Coolify:
     async def start(self, uuid: str):
         _check(await self.c.post(f"/applications/{uuid}/start"))
 
+    async def add_volume(self, uuid: str, data_dir: str):
+        """Постоянная папка: data/ проекта становится томом /app/data и не пропадает при пересборке."""
+        # Coolify сам добавляет к имени тома идентификатор приложения.
+        body = {"type": "persistent", "name": data_dir.strip("/").replace("/", "-"),
+                "mount_path": "/app/" + data_dir.strip("/")}
+        _check(await self.c.post(f"/applications/{uuid}/storages", json=body))
+
     async def create_postgres(self, name: str) -> tuple[str, str]:
         """Создаёт PostgreSQL с ночной резервной копией. Возвращает (uuid, внутренний адрес для DATABASE_URL)."""
         body = {"server_uuid": CFG["CF_SERVER_UUID"], "project_uuid": CFG["CF_PROJECT_UUID"],

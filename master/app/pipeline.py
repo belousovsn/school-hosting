@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 from . import db
 import httpx
 
-from .analyze import BOT_TYPES, DB_ENV, analyze, contract_toml, find_parts, needed_for_analysis, norm_pkg, parse_requirements, resolve, scope
+from .analyze import (BOT_TYPES, DB_ENV, NOT_DATA_DIRS, analyze, contract_toml, find_parts, needed_for_analysis, norm_pkg,
+                      parse_requirements, resolve, scope)
 from .checks import check_push, find_tokens, scannable, verdict
 from .clients import CFG, Coolify, Docker, Forgejo, Telegram, notify
 from . import sync as gitsync
@@ -169,9 +170,13 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
     uuid, url = await cf.create_app(d["repo"], d["branch"], c, name=name)
     for key in c["secrets"]:
         await cf.set_env(uuid, key, secrets[key].strip())
+    if c.get("data_dir"):
+        await cf.add_volume(uuid, c["data_dir"])
     source = d["source"] if is_external(d["source"]) else ""
-    pid = db.run("INSERT INTO projects (repo, name, app_uuid, type, branch, url, source, contract_path, created) VALUES (?,?,?,?,?,?,?,?,?)",
-                 d["repo"], name, uuid, c["type"], d["branch"], url, source, contract_path, time.time())
+    pid = db.run("INSERT INTO projects (repo, name, app_uuid, type, branch, url, source, contract_path, data_dir, created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 d["repo"], name, uuid, c["type"], d["branch"], url, source, contract_path, c.get("data_dir", ""), time.time())
+    if c.get("data_dir"):
+        db.event(pid, "info", f"Папка {c['data_dir']}/ сохраняется между обновлениями.")
     db.event(pid, "info", "Проект подключён." + (f" Адрес: {url}." if url else "") + (" " + " ".join(notes) if notes else ""))
     db.run("DELETE FROM drafts WHERE id=?", draft_id)
     if db_choice == "new":
@@ -181,6 +186,25 @@ async def finish_connect(draft_id: int, answers: dict, secrets: dict[str, str], 
     await handle_push(pid, sha)
     await fj.set_master_hook(d["repo"])
     return pid, []
+
+
+DATA_DIR_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
+
+
+async def add_data_dir(pid: int, data_dir: str):
+    """Делает папку проекта постоянной и перезапускает его. Файлы, которые уже были в папке, начнутся заново."""
+    data_dir = data_dir.strip().strip("/")
+    if not DATA_DIR_RE.match(data_dir) or ".." in data_dir.split("/") or data_dir in NOT_DATA_DIRS:
+        raise ValueError(f"Папку «{data_dir}» сделать постоянной нельзя. Подходит папка с данными, например data.")
+    p = db.one("SELECT * FROM projects WHERE id=?", pid)
+    if p["type"] == "static":
+        raise ValueError("Статическому сайту постоянная папка не нужна.")
+    if p.get("data_dir"):
+        raise ValueError(f"У проекта уже есть постоянная папка {p['data_dir']}/.")
+    await cf.add_volume(p["app_uuid"], data_dir)
+    db.run("UPDATE projects SET data_dir=? WHERE id=?", data_dir, pid)
+    db.event(pid, "info", f"Папка {data_dir}/ теперь сохраняется между обновлениями.")
+    await handle_push(pid, await fj.head(p["repo"], p["branch"]), force=True)
 
 
 async def create_database(name: str) -> int:
