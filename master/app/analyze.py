@@ -35,7 +35,13 @@ IMPORT_TO_PKG = {
     "psycopg2": "psycopg2-binary", "psycopg": "psycopg[binary]",
 }
 # Признаки того, что программе нужна база данных PostgreSQL.
-PY_DB_LIBS = {"psycopg", "psycopg2", "asyncpg", "sqlalchemy", "peewee", "tortoise", "databases"}
+PY_PG_DRIVERS = {"psycopg", "psycopg2", "asyncpg"}
+PY_ORMS = {"sqlalchemy", "peewee", "tortoise", "databases"}  # работают и с SQLite, поэтому сами по себе базу не требуют
+ENV_EXAMPLES = (".env.example", ".env.sample", ".env.template", ".env.dist", "env.example", "example.env")
+ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", re.M)
+SETTINGS_CLASS_RE = re.compile(r"^class\s+\w+\s*\([^)]*\bBaseSettings\b[^)]*\)\s*:\s*$", re.M)
+SETTINGS_FIELD_RE = re.compile(r"^[ \t]+([a-z_][a-z0-9_]*)\s*:\s*[^=\n]+(=.*)?$")
+ENV_PREFIX_RE = re.compile(r"""env_prefix\s*=\s*['"]([^'"]*)['"]""")
 NODE_DB_LIBS = {"pg", "postgres", "pg-promise", "@prisma/client", "prisma", "knex", "sequelize", "typeorm", "drizzle-orm"}
 DB_ENV = "DATABASE_URL"
 PY_BOT_LIBS = {"aiogram": "aiogram", "telegram": "python-telegram-bot", "telebot": "pyTelegramBotAPI"}
@@ -124,7 +130,29 @@ def _shallowest(paths: list[str]) -> list[str]:
 def needed_for_analysis(path: str) -> bool:
     """Файлы, которые нужно прочитать, чтобы разобрать проект."""
     return path.endswith((".py", ".env", ".json", ".cfg", ".ini", ".js", ".mjs", ".cjs", ".ts")) \
-        or posixpath.basename(path) in ("requirements.txt", "school.toml")
+        or posixpath.basename(path) in ("requirements.txt", "school.toml") + ENV_EXAMPLES
+
+
+def example_env_vars(files: dict[str, str]) -> set[str]:
+    """Переменные из образца настроек (.env.example и похожих): так проекты часто перечисляют, что им нужно."""
+    return {m for p, t in files.items() if posixpath.basename(p) in ENV_EXAMPLES for m in ENV_LINE_RE.findall(t)}
+
+
+def settings_env_vars(text: str) -> set[str]:
+    """Переменные, которые читает класс настроек pydantic-settings: поле bot_token берётся из BOT_TOKEN."""
+    out: set[str] = set()
+    for m in SETTINGS_CLASS_RE.finditer(text):
+        body = []
+        for line in text[m.end():].splitlines()[1:]:
+            if line.strip() and not line[:1].isspace():
+                break  # класс закончился
+            body.append(line)
+        prefix = (ENV_PREFIX_RE.search("\n".join(body)) or [None, ""])[1]
+        for line in body:
+            f = SETTINGS_FIELD_RE.match(line)
+            if f and f.group(1) not in ("model_config", "Config") and not line.lstrip().startswith(("def ", "@")):
+                out.add((prefix + f.group(1)).upper())
+    return out
 
 
 def detect_runtime(paths: list[str]) -> list[str]:
@@ -228,15 +256,19 @@ def _analyze_python(paths: list[str], files: dict[str, str], base: dict) -> dict
     elif missing:
         warnings.append("В requirements.txt не хватает пакетов: " + ", ".join(missing))
 
-    env_vars = sorted({a or b for t in py.values() for a, b in PY_ENV_RE.findall(t)})
+    env_vars = sorted({a or b for t in py.values() for a, b in PY_ENV_RE.findall(t)}
+                      | {v for t in py.values() for v in settings_env_vars(t)} | example_env_vars(files))
     secrets = _secrets(env_vars)
     tokens = find_hardcoded_tokens({p: t for p, t in files.items() if p.endswith((".py", ".env", ".json", ".toml", ".cfg", ".ini"))})
     _token_problems(kind, tokens, secrets, problems, "os.getenv(\"BOT_TOKEN\")")
 
-    wants_db = DB_ENV in env_vars or bool(imports & PY_DB_LIBS)
+    uses_sqlite = any("sqlite" in t for t in py.values())
+    wants_db = DB_ENV in env_vars or bool(imports & PY_PG_DRIVERS) or (bool(imports & PY_ORMS) and not uses_sqlite)
     data_paths = sorted({m for t in py.values() for m in SQLITE_RE.findall(t) + WRITE_RE.findall(t)})
     if data_paths:
         warnings.append("Программа пишет в файлы (" + ", ".join(data_paths[:5]) + "). Они сбрасываются при каждом обновлении. Данные, которые надо хранить, лучше держать в базе данных.")
+    elif uses_sqlite:
+        warnings.append("Программа хранит данные в SQLite. Файл базы сбрасывается при каждом обновлении проекта: рейтинги и прогресс пропадут.")
     return {"type": kind, "framework": framework, "entry_candidates": candidates, "req_candidates": reqs,
             "missing_packages": missing, "env_vars": env_vars, "secrets": secrets, "hardcoded_tokens": tokens,
             "data_paths": data_paths, "problems": problems, "warnings": warnings, "questions": questions,
@@ -294,7 +326,7 @@ def _analyze_node(paths: list[str], files: dict[str, str], base: dict) -> dict:
     if missing:
         warnings.append("В package.json нет пакетов, которые подключаются в коде: " + ", ".join(missing))
 
-    env_vars = sorted({a or b for t in js.values() for a, b in JS_ENV_RE.findall(t)})
+    env_vars = sorted({a or b for t in js.values() for a, b in JS_ENV_RE.findall(t)} | example_env_vars(files))
     secrets = _secrets(env_vars)
     tokens = find_hardcoded_tokens({p: t for p, t in files.items() if p.endswith((".js", ".mjs", ".cjs", ".ts", ".json", ".env"))})
     _token_problems(kind, tokens, secrets, problems, "process.env.BOT_TOKEN")

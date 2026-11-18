@@ -45,3 +45,18 @@ def test_revoked_token_does_not_block(monkeypatch):
     monkeypatch.setattr(pipeline.Telegram, "token_alive", staticmethod(alive))
     asyncio.run(pipeline._soften_revoked_tokens(f))
     assert verdict(f) == "block" and "_token" not in f[0]  # сам токен в базу мастера не попадает
+
+
+def test_pydantic_settings_and_env_example():
+    from app.analyze import analyze, settings_env_vars
+    cfg = ("from pydantic_settings import BaseSettings, SettingsConfigDict\n\n\n"
+           "class Settings(BaseSettings):\n    model_config = SettingsConfigDict(env_file='.env')\n\n"
+           "    bot_token: str\n    admin_ids: str = ''\n\n    @property\n    def admins(self):\n        return 1\n\n\n"
+           "class Other(BaseSettings):\n    model_config = SettingsConfigDict(env_prefix='APP_')\n    api_key: str\n\n\ndef get():\n    pass\n")
+    assert settings_env_vars(cfg) == {"BOT_TOKEN", "ADMIN_IDS", "APP_API_KEY"}
+    bot = "from aiogram import Bot\nfrom config import Settings\nfrom sqlalchemy.ext.asyncio import create_async_engine\n" \
+          "e = create_async_engine('sqlite+aiosqlite:///data/x.db')\nif __name__ == '__main__':\n    dp.start_polling()\n"
+    a = analyze(["bot.py", "config.py", "requirements.txt", ".env.example"],
+                {"bot.py": bot, "config.py": cfg, "requirements.txt": "aiogram\nsqlalchemy\npydantic-settings\n", ".env.example": "BOT_TOKEN=\nLOG_LEVEL=INFO\n"})
+    assert a["problems"] == [] and "BOT_TOKEN" in a["secrets"] and "LOG_LEVEL" in a["env_vars"]
+    assert not a["wants_db"] and any("SQLite" in w for w in a["warnings"])  # SQLAlchemy с SQLite: PostgreSQL не предлагаем
