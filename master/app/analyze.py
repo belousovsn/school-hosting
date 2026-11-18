@@ -290,7 +290,7 @@ def _analyze_python(paths: list[str], files: dict[str, str], base: dict) -> dict
     return {"type": kind, "framework": framework, "entry_candidates": candidates, "req_candidates": reqs,
             "missing_packages": missing, "env_vars": env_vars, "secrets": secrets, "hardcoded_tokens": tokens,
             "data_paths": data_paths, "problems": problems, "warnings": warnings, "questions": questions,
-            "wants_db": wants_db, "data_dir": data_dir, "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
+            "wants_db": wants_db, "data_dir": data_dir, "uses_sqlite": uses_sqlite, "app_vars": {p: PY_APP_RE.search(t).group(1) for p, t in py.items() if PY_APP_RE.search(t)}}
 
 
 def _analyze_node(paths: list[str], files: dict[str, str], base: dict) -> dict:

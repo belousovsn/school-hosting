@@ -237,11 +237,20 @@ def db_card(a: dict) -> str:
     """Выбор базы данных при подключении. По умолчанию базы нет, если код её не просит."""
     dbs = db.all_("SELECT * FROM databases ORDER BY id")
     wants = a.get("wants_db")
-    hint = "Код работает с базой данных (нашёл DATABASE_URL или библиотеку для PostgreSQL)." if wants else \
-        "Код не похож на работу с базой. Если она всё же нужна, её можно подключить и позже на странице проекта."
-    opts = [("none", "Без базы данных", not wants), ("new", "Создать новую базу PostgreSQL", wants)]
+    if wants:
+        hint = "Код подключается к серверу баз данных (нашёл DATABASE_URL или библиотеку для PostgreSQL)."
+    elif a.get("data_dir"):
+        hint = (f"Своя база у программы уже есть: файл SQLite в папке <code>{escape(a['data_dir'])}/</code>. Чтобы он не пропадал, "
+                "хватит постоянной папки выше, отдельный сервер базы этой программе не нужен.")
+    elif a.get("uses_sqlite"):
+        hint = "Программа хранит данные в файле SQLite, ей отдельный сервер базы не нужен. Чтобы файл не пропадал, положи его в папку data/."
+    else:
+        hint = "Код не похож на работу с сервером баз данных. Если он всё же нужен, его можно подключить и позже на странице проекта."
+    opts = [("none", "Не нужен", not wants), ("new", "Создать новую базу PostgreSQL", wants)]
     opts += [(f"existing:{x['id']}", f"Общая база {x['name']} (как у " + (", ".join(u["name"] for u in db.all_("SELECT name FROM projects WHERE db_id=?", x["id"])) or "никого") + ")", False) for x in dbs]
-    out = f'<div class="card"><b>База данных</b><p class="muted">{hint} Адрес базы программа получит в переменной <code>DATABASE_URL</code>. Копия базы делается каждую ночь.</p>'
+    out = (f'<div class="card"><b>Отдельный сервер базы данных PostgreSQL</b><p class="muted">{hint} '
+           'Нужен программам, которые подключаются к базе по адресу из переменной <code>DATABASE_URL</code>, '
+           'например боту и сайту с общими данными. Копия такой базы делается каждую ночь.</p>')
     out += "".join(f'<label><input type="radio" name="q_db" value="{v}" {"checked" if c else ""}> {escape(label)}</label>' for v, label, c in opts)
     return out + "</div>"
 
@@ -388,12 +397,12 @@ def project_db_card(p: dict) -> str:
         base = db.one("SELECT * FROM databases WHERE id=?", p["db_id"]) or {"name": "?"}
         others = [x["name"] for x in db.all_("SELECT name FROM projects WHERE db_id=? AND id!=?", p["db_id"], pid)]
         shared = f" Эту же базу используют: {escape(', '.join(others))}." if others else ""
-        return (f'<div class="card"><b>База данных</b><p>Подключена база <code>{escape(base["name"])}</code>, адрес в переменной '
+        return (f'<div class="card"><b>Сервер базы данных PostgreSQL</b><p>Подключена база <code>{escape(base["name"])}</code>, адрес в переменной '
                 f'<code>DATABASE_URL</code>.{shared} Копия делается каждую ночь, хранятся 7 последних.</p></div>')
     dbs = db.all_("SELECT * FROM databases ORDER BY id")
     opts = '<option value="new">Создать новую базу PostgreSQL</option>' + "".join(
         f'<option value="existing:{x["id"]}">Общая база {escape(x["name"])}</option>' for x in dbs)
-    return (f'<div class="card"><b>База данных</b><p class="muted">Не подключена. После подключения программа получит адрес базы '
+    return (f'<div class="card"><b>Сервер базы данных PostgreSQL</b><p class="muted">Не подключён. Нужен, только если программа подключается к базе по <code>DATABASE_URL</code>; файл SQLite в постоянной папке его не требует. После подключения программа получит адрес базы '
             f'в переменной <code>DATABASE_URL</code> и перезапустится.</p>'
             f'<form method="post" action="/projects/{pid}/db" data-busy="Подключаю базу…"><select name="choice">{opts}</select> '
             f'<button class="ghost">Подключить базу</button></form></div>')
