@@ -491,11 +491,30 @@ async def github_watcher():
                     db.event(p["id"], "warn", msg)
 
 
+async def keep_stopped(p: dict) -> bool:
+    """Остановленный проект не должен работать. Сборка, которая закончилась уже после остановки,
+    снова запускает контейнер, и панель показывает «Остановлен», хотя программа работает.
+    Такой контейнер останавливаем ещё раз. Возвращает True, если пришлось остановить."""
+    if not await dk.container_for(p["app_uuid"]):
+        return False
+    dep = await cf.latest_deployment(p["app_uuid"])
+    if dep and dep.get("status") in ("queued", "in_progress"):
+        return False  # остановим, когда сборка закончится, иначе она запустит контейнер снова
+    await cf.stop(p["app_uuid"])
+    db.event(p["id"], "warn", "Сборка закончилась после остановки и снова запустила проект. Мастер остановил его ещё раз.")
+    return True
+
+
 async def cpu_monitor():
     """Раз в минуту смотрит загрузку. Проект, который 10 минут подряд упирается в лимит, останавливается."""
     if not dk.enabled:
         return
     while True:
+        for p in db.all_("SELECT * FROM projects WHERE status='stopped'"):
+            try:
+                await keep_stopped(p)
+            except Exception as e:
+                db.event(p["id"], "warn", f"Монитор не смог проверить остановленный проект: {e}")
         for p in db.all_("SELECT * FROM projects WHERE status IN ('running','deploying')"):
             try:
                 cont = await dk.container_for(p["app_uuid"])
